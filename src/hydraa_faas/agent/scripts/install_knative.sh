@@ -1,19 +1,13 @@
 #!/bin/bash
-#
-# install_knative.sh: Deploys the Knative platform.
-#
-# Prerequisites:
-#   - A running Minikube cluster. Run 'install_minikube.sh' first.
-#
 
 set -euo pipefail
 
-# --- Configuration ---
+
 KNATIVE_SERVING_VERSION="v1.14.0"
 KNATIVE_NET_KOURIER_VERSION="v1.14.0"
 CERT_MANAGER_VERSION="v1.15.1"
 
-# --- Logging and Utility Functions ---
+
 LOG_OUT="$HOME/knative_install.out"
 LOG_ERR="$HOME/knative_install.err"
 >"$LOG_OUT"
@@ -35,9 +29,9 @@ run() {
     fi
 }
 
-# --- Main Installation Logic ---
+
 main() {
-    # Dependency Check
+
     if ! minikube status &>/dev/null; then
        log_error "Minikube is not running. Please run the install_minikube.sh script first."
     fi

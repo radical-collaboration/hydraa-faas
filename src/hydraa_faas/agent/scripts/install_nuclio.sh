@@ -1,14 +1,8 @@
 #!/bin/bash
-#
-# install_nuclio.sh: Deploys the Nuclio platform.
-#
-# Prerequisites:
-#   - A running Minikube cluster. Run 'install_minikube.sh' first.
-#
+
 
 set -euo pipefail
 
-# --- Logging and Utility Functions ---
 LOG_OUT="$HOME/nuclio_install.out"
 LOG_ERR="$HOME/nuclio_install.err"
 >"$LOG_OUT"
@@ -38,20 +32,20 @@ get_os() {
     esac
 }
 
-# --- Main Installation Logic ---
+
 main() {
-    # Dependency Check
+
     if ! minikube status &>/dev/null; then
        log_error "Minikube is not running. Please run the install_minikube.sh script first."
     fi
     log_message "Minikube dependency met."
 
-    # Install nuctl
+ 
     if ! command -v nuctl &>/dev/null; then
         log_message "Installing nuctl CLI..."
         local OS
         OS=$(get_os)
-        # Fetch the latest version tag from GitHub API
+    
         local LATEST_VERSION
         LATEST_VERSION=$(curl -s "https://api.github.com/repos/nuclio/nuclio/releases/latest" | grep -Po '"tag_name": "\K.*?(?=")')
         if [ -z "$LATEST_VERSION" ]; then
@@ -67,7 +61,7 @@ main() {
         log_message "nuctl is already installed."
     fi
 
-    # Deploy Nuclio using Helm
+
     log_message "Checking if Nuclio is already installed..."
     if ! helm status nuclio -n nuclio &>/dev/null; then
         log_message "Adding Nuclio Helm repo..."
@@ -75,7 +69,7 @@ main() {
         run helm repo update
         
         log_message "Deploying Nuclio via Helm..."
-        # Create namespace if it doesn't exist
+
         kubectl create namespace nuclio --dry-run=client -o yaml | kubectl apply -f -
         run helm install nuclio nuclio/nuclio --namespace nuclio --wait
     else
