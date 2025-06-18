@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import uuid
 import logging
@@ -11,12 +10,10 @@ from utils.docker_utils import build_image
 from platforms.base import FaasPlatform
 from platforms.openfaas import OpenFaasPlatform
 
-# —— Configuration via env vars ——  
 REGISTRY_URL = os.environ.get("RADICAL_FAAS_REGISTRY", "localhost:5000")
 PLATFORM    = os.environ.get("RADICAL_FAAS_PLATFORM", "openfaas").lower()
 OPENFAAS    = os.environ.get("OPENFAAS_GATEWAY", "http://127.0.0.1:31112")
 
-# —— Logging setup ——  
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
@@ -24,13 +21,13 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# —— Choose adapter ——  
+
 if PLATFORM == "openfaas":
     adapter: FaasPlatform = OpenFaasPlatform()
 else:
     raise NotImplementedError(f"Platform '{PLATFORM}' is not supported.")
 
-# —— Prepare functions dir & load Dockerfile template ——  
+
 try:
     BASE_DIR = os.getenv(
         "RADICAL_FAAS_FUNCTIONS_DIR",
@@ -48,7 +45,7 @@ except TemplateError as e:
     log.error(f"Fatal: Jinja2 template error: {e}")
     exit(1)
 
-# —— Flask app ——  
+ 
 app = Flask(__name__)
 
 def save_function_code(func_id: str, code: str) -> str:
@@ -118,7 +115,7 @@ def invoke_function(func_id):
         log.exception("Unexpected error")
         return jsonify(error="Server error"), 500
 
-    # Proxy raw response
+    # proxy raw response
     return result, 200, {"Content-Type": "application/octet-stream"}
 
 if __name__ == "__main__":

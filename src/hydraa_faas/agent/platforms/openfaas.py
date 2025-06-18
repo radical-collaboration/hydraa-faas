@@ -10,7 +10,7 @@ GATEWAY  = os.environ.get("OPENFAAS_GATEWAY",  "http://127.0.0.1:8080")
 USERNAME = os.environ.get("OPENFAAS_USERNAME")
 PASSWORD = os.environ.get("OPENFAAS_PASSWORD")
 
-# If both are set, requests will send HTTP Basic Auth.
+# if both are set, requests will send HTTP basic auth
 _AUTH = (USERNAME, PASSWORD) if USERNAME and PASSWORD else None
 
 class OpenFaasPlatform(FaasPlatform):
