@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+import json
+
+# User-defined handler function
+{{ handler_code }}
+
+def handler(context, event):
+    """Nuclio handler function"""
+    try:
+        # Get the request body
+        body = event.body
+        
+        # Parse the payload
+        if body:
+            try:
+                if isinstance(body, bytes):
+                    body = body.decode('utf-8')
+                payload = json.loads(body) if body.strip() else {}
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                payload = body if body else {}
+        else:
+            payload = {}
+        
+        # Call user handler
+        result = handle(payload)
+        
+        # Return response
+        if isinstance(result, (dict, list)):
+            return context.Response(body=json.dumps(result), 
+                                  headers={'Content-Type': 'application/json'},
+                                  status_code=200)
+        else:
+            return context.Response(body=json.dumps({"result": str(result)}),
+                                  headers={'Content-Type': 'application/json'},
+                                  status_code=200)
+            
+    except Exception as e:
+        error_response = {"error": str(e), "type": type(e).__name__}
+        return context.Response(body=json.dumps(error_response),
+                              headers={'Content-Type': 'application/json'},
+                              status_code=500)

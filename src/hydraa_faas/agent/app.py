@@ -1,124 +1,198 @@
+#!/usr/bin/env python3
+"""
+FaaS middleware agent main application
+"""
+
 import os
+import json
 import uuid
-import logging
+import tempfile
 import shutil
+from pathlib import Path
+from typing import Dict, Any, Optional
 
 from flask import Flask, request, jsonify
-from jinja2 import Template, TemplateError
+from jinja2 import Environment, FileSystemLoader
 
-from utils.docker_utils import build_image
 from platforms.base import FaasPlatform
-from platforms.openfaas import OpenFaasPlatform
+from platforms.knative import KnativePlatform
+from platforms.nuclio import NuclioPlatform
+from utils.docker_utils import DockerUtils
 
-REGISTRY_URL = os.environ.get("RADICAL_FAAS_REGISTRY", "localhost:5000")
-PLATFORM    = os.environ.get("RADICAL_FAAS_PLATFORM", "openfaas").lower()
-OPENFAAS    = os.environ.get("OPENFAAS_GATEWAY", "http://127.0.0.1:31112")
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-log = logging.getLogger(__name__)
-
-
-if PLATFORM == "openfaas":
-    adapter: FaasPlatform = OpenFaasPlatform()
-else:
-    raise NotImplementedError(f"Platform '{PLATFORM}' is not supported.")
-
-
-try:
-    BASE_DIR = os.getenv(
-        "RADICAL_FAAS_FUNCTIONS_DIR",
-        os.path.join(os.getcwd(), "functions")
-    )
-    os.makedirs(BASE_DIR, exist_ok=True)
-
-    with open("templates/Dockerfile.j2") as f:
-        dockerfile_tpl = Template(f.read())
-
-except FileNotFoundError:
-    log.error("Fatal: Could not find templates/Dockerfile.j2. Exiting.")
-    exit(1)
-except TemplateError as e:
-    log.error(f"Fatal: Jinja2 template error: {e}")
-    exit(1)
-
- 
+# initialize Flask app
 app = Flask(__name__)
 
-def save_function_code(func_id: str, code: str) -> str:
-    """
-    Writes handler.py, requirements.txt, Dockerfile into
-    functions/<func_id>/ and returns that path.
-    """
-    func_dir = os.path.join(BASE_DIR, func_id)
-    os.makedirs(func_dir, exist_ok=True)
+# global configuration
+CONFIG = {
+    'FAAS_WORKFLOW': os.getenv('FAAS_WORKFLOW', 'local'),
+    'RADICAL_FAAS_PLATFORM': os.getenv('RADICAL_FAAS_PLATFORM', 'knative'),
+    'RADICAL_FAAS_REGISTRY': os.getenv('RADICAL_FAAS_REGISTRY'),
+}
 
-    # write user code as handler.py
-    with open(os.path.join(func_dir, "handler.py"), "w") as f:
-        f.write(code)
+# initialize platform adapter and utilities
+def get_platform_adapter() -> FaasPlatform:
+    """Factory function to create the appropriate platform adapter"""
+    platform_name = CONFIG['RADICAL_FAAS_PLATFORM']
+    return KnativePlatform() if platform_name == 'knative' else NuclioPlatform()
 
-    # copy global requirements.txt (if present) into func dir
-    src_reqs = os.path.join(os.getcwd(), "requirements.txt")
-    dst_reqs = os.path.join(func_dir, "requirements.txt")
-    if os.path.exists(src_reqs):
-        shutil.copy(src_reqs, dst_reqs)
+platform_adapter = get_platform_adapter()
+docker_utils = DockerUtils()
+
+# initialize Jinja2 template environment
+template_dir = Path(__file__).parent / 'templates'
+jinja_env = Environment(loader=FileSystemLoader(str(template_dir)))
+
+# utility functions
+def generate_function_id() -> str:
+    """Generate a unique function ID"""
+    return f"func-{uuid.uuid4().hex[:8]}"
+
+def get_image_name(func_id: str) -> str:
+    """Generate the appropriate Docker image name based on workflow"""
+    if CONFIG['FAAS_WORKFLOW'] == 'local':
+        return f"{func_id}:latest"
     else:
-        open(dst_reqs, "w").close()
+        registry = CONFIG['RADICAL_FAAS_REGISTRY'].rstrip('/')
+        return f"{registry}/{func_id}:latest"
 
-    # render Dockerfile
-    df_content = dockerfile_tpl.render()
-    with open(os.path.join(func_dir, "Dockerfile"), "w") as f:
-        f.write(df_content)
 
-    log.info(f"Saved code & Dockerfile to {func_dir}")
-    return func_dir
 
-@app.route("/functions", methods=["POST"])
-def create_function():
-    payload = request.get_json()
-    if not payload or not payload.get("code"):
-        return jsonify(error="Missing 'code' in JSON body"), 400
-
-    code    = payload["code"]
-    func_id = payload.get("func_id", str(uuid.uuid4()))
-    log.info(f"Deploy request → ID={func_id}")
-
+def create_function_package(func_id: str, handler_code: str, 
+                          requirements: Optional[str] = None) -> str:
+    """Create a complete function package with dockerfile and handler code"""
+    package_dir = tempfile.mkdtemp(prefix=f"faas-{func_id}-")
+    package_path = Path(package_dir)
+    
     try:
-        func_path = save_function_code(func_id, code)
-        image     = build_image(func_id, func_path, REGISTRY_URL)
-        adapter.deploy(func_id, image)
-
-    except (RuntimeError, NotImplementedError) as e:
-        log.error(e)
-        return jsonify(error=str(e)), 500
-
+        # set template parameters
+        template_params = {
+            'PYTHON_VERSION': '3.11',
+            'REQUIREMENTS': requirements or '',
+        }
+        
+        # generate dockerfile from template
+        dockerfile_template = jinja_env.get_template('Dockerfile.j2')
+        dockerfile_content = dockerfile_template.render(**template_params)
+        
+        # create the appropriate handler based on platform
+        platform = CONFIG['RADICAL_FAAS_PLATFORM']
+        if platform == 'nuclio':
+            handler_template = jinja_env.get_template('nuclio_handler.py.j2')
+        else:  # knative
+            handler_template = jinja_env.get_template('knative_handler.py.j2')
+        
+        handler_content = handler_template.render(handler_code=handler_code)
+        
+        # write files
+        (package_path / 'Dockerfile').write_text(dockerfile_content)
+        (package_path / 'handler.py').write_text(handler_content)
+        
+        if requirements:
+            (package_path / 'requirements.txt').write_text(requirements)
+        
+        return package_dir
+        
     except Exception as e:
-        log.exception("Unexpected error")
-        return jsonify(error="Server error"), 500
+        shutil.rmtree(package_dir, ignore_errors=True)
+        raise e
 
-    return jsonify(func_id=func_id, status="deployed"), 201
+# API
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    return jsonify({
+        'status': 'healthy',
+        'platform': CONFIG['RADICAL_FAAS_PLATFORM'],
+        'workflow': CONFIG['FAAS_WORKFLOW']
+    })
 
-@app.route("/functions/<func_id>/invoke", methods=["POST"])
-def invoke_function(func_id):
-    payload = request.get_data() or b""
-    log.info(f"Invoke request → ID={func_id}")
-
+@app.route('/deploy', methods=['POST'])
+def deploy_function():
+    """Deploy a function to the configured FaaS platform"""
     try:
-        result = adapter.invoke(func_id, payload)
-    except RuntimeError as e:
-        log.error(e)
-        return jsonify(error=str(e)), 500
-    except Exception:
-        log.exception("Unexpected error")
-        return jsonify(error="Server error"), 500
+        data = request.get_json()
+        if not data or not data.get('handler'):
+            return jsonify({'error': 'handler field is required'}), 400
+        
+        # extract parameters
+        func_id = data.get('id') or generate_function_id()
+        handler_code = data['handler']
+        requirements = data.get('requirements')
+        
+        # create and build function package
+        package_dir = create_function_package(func_id, handler_code, requirements)
+        
+        try:
+            image_name = get_image_name(func_id)
+            
+            # build and optionally push docker image (this is for registry workflow)
+            docker_utils.build_image(package_dir, image_name)
+            
+            if CONFIG['FAAS_WORKFLOW'] == 'registry':
+                docker_utils.push_image(image_name)
+            
+            # deploy to faas platform
+            deployment_result = platform_adapter.deploy(func_id, image_name)
+            
+            response = {
+                'id': func_id,
+                'image': image_name,
+                **deployment_result
+            }
+            
+            return jsonify(response), 200
+            
+        finally:
+            shutil.rmtree(package_dir, ignore_errors=True)
+            
+    except Exception as e:
+        return jsonify({'error': f"Deployment failed: {str(e)}"}), 500
 
-    # proxy raw response
-    return result, 200, {"Content-Type": "application/octet-stream"}
+@app.route('/invoke', methods=['POST'])
+def invoke_function():
+    """Invoke a deployed function"""
+    try:
+        data = request.get_json()
+        if not data or not data.get('id'):
+            return jsonify({'error': 'id field is required'}), 400
+        
+        func_id = data['id']
+        payload = data.get('payload', {})
+        
+        result = platform_adapter.invoke(func_id, payload)
+        return jsonify(result), 200
+        
+    except Exception as e:
+        return jsonify({'error': f"Function invocation failed: {str(e)}"}), 500
 
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5001))
-    log.info(f"Starting Radical-FaaS agent on 0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port)
+@app.route('/functions', methods=['GET'])
+def list_functions():
+    """List deployed functions"""
+    try:
+        functions = platform_adapter.list_functions()
+        return jsonify({'functions': functions}), 200
+    except Exception as e:
+        return jsonify({'error': f"Function listing failed: {str(e)}"}), 500
+
+@app.route('/delete', methods=['POST'])
+def delete_function():
+    """Delete a deployed function"""
+    try:
+        data = request.get_json()
+        if not data or not data.get('id'):
+            return jsonify({'error': 'id field is required'}), 400
+        
+        func_id = data['id']
+        result = platform_adapter.delete_function(func_id)
+        return jsonify(result), 200
+        
+    except Exception as e:
+        return jsonify({'error': f"Function deletion failed: {str(e)}"}), 500
+
+if __name__ == '__main__':
+    print(f"FaaS Middleware Agent Starting")
+    print(f"Platform: {CONFIG['RADICAL_FAAS_PLATFORM']}")
+    print(f"Workflow: {CONFIG['FAAS_WORKFLOW']}")
+    
+    port = int(os.getenv('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
