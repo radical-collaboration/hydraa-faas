@@ -1,25 +1,38 @@
-"""Knative platform adapter"""
+"""Knative platform adapter."""
 
 import os
 import json
 import time
 import subprocess
 import requests
+import platform
 from typing import Dict, Any, List
 
 from .base import FaasPlatform, PlatformError, create_deployment_spec
 
 
 class KnativePlatform(FaasPlatform):
-    """Knative platform adapter implementation"""
+    """Knative platform implementation using kn CLI."""
     
     def __init__(self):
+        """Initialize knative platform adapter."""
         self.domain = os.getenv('KNATIVE_DOMAIN', '192.168.49.2.nip.io')
         self.namespace = os.getenv('KNATIVE_NAMESPACE', 'default')
         self.timeout = int(os.getenv('KNATIVE_TIMEOUT', '300'))
+        self.is_macos = platform.system() == 'Darwin'
     
     def _run_command(self, args: List[str]) -> subprocess.CompletedProcess:
-        """Run kn CLI command"""
+        """Run kn CLI command.
+        
+        Args:
+            args: Command arguments.
+            
+        Returns:
+            Completed subprocess result.
+            
+        Raises:
+            PlatformError: If command fails or times out.
+        """
         cmd = ['kn'] + args
         try:
             return subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
@@ -29,12 +42,30 @@ class KnativePlatform(FaasPlatform):
             raise PlatformError(f"Command failed: {e}")
     
     def _service_exists(self, func_id: str) -> bool:
-        """Check if Knative service exists"""
+        """Check if knative service exists.
+        
+        Args:
+            func_id: Function identifier.
+            
+        Returns:
+            True if service exists.
+        """
         result = self._run_command(['service', 'describe', func_id, '--namespace', self.namespace])
         return result.returncode == 0
     
     def deploy(self, func_id: str, image: str) -> Dict[str, Any]:
-        """Deploy function to Knative"""
+        """Deploy function to knative.
+        
+        Args:
+            func_id: Function identifier.
+            image: Docker image name.
+            
+        Returns:
+            Deployment result with status and endpoint.
+            
+        Raises:
+            PlatformError: If deployment fails.
+        """
         workflow = os.getenv('FAAS_WORKFLOW', 'local')
         deployment_spec = create_deployment_spec(func_id, image, workflow)
         
@@ -84,7 +115,14 @@ class KnativePlatform(FaasPlatform):
         }
     
     def _get_service_url(self, func_id: str) -> str:
-        """Get local accessible URL for the service"""
+        """Get service URL for function invocation.
+        
+        Args:
+            func_id: Function identifier.
+            
+        Returns:
+            Service URL for function.
+        """
         try:
             # get kourier nodePort
             result = subprocess.run([
@@ -110,41 +148,75 @@ class KnativePlatform(FaasPlatform):
         return f"http://{func_id}.{self.namespace}.{self.domain}"
     
     def invoke(self, func_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """Invoke function on Knative"""
-        service_url = self._get_service_url(func_id)
+        """Invoke function on knative.
         
-        # prepare request
-        headers = {
-            'Content-Type': 'application/json',
-            'Host': f"{func_id}.{self.namespace}.{self.domain}"
-        }
-        data = json.dumps(payload)
-        
-        start_time = time.time()
-        try:
-            response = requests.post(service_url, data=data, headers=headers, timeout=self.timeout)
+        Args:
+            func_id: Function identifier.
+            payload: Data to send to function.
+            
+        Returns:
+            Function result with execution status and time.
+            
+        Raises:
+            PlatformError: If invocation fails.
+        """
+        if self.is_macos:
+            # port forward directly to kourier (knative's ingress)
+            import socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', 0))
+                local_port = s.getsockname()[1]
+            
+            # port forward to kourier service
+            port_forward_process = subprocess.Popen([
+                'kubectl', 'port-forward', '-n', 'kourier-system',
+                'svc/kourier', f'{local_port}:80'
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            time.sleep(3)  # wait for port forwarding
+            
+            try:
+                headers = {
+                    'Content-Type': 'application/json',
+                    'Host': f"{func_id}.{self.namespace}.{self.domain}"
+                }
+                
+                start_time = time.time()
+                response = requests.post(f"http://localhost:{local_port}", 
+                                       json=payload, headers=headers, timeout=90)
+                execution_time = time.time() - start_time
+                
+                if response.status_code == 200:
+                    result = response.json() if response.headers.get('content-type', '').startswith('application/json') else response.text
+                    return {'result': result, 'status': 'success', 'execution_time': execution_time, 'platform': 'knative'}
+                else:
+                    raise PlatformError(f"HTTP {response.status_code}: {response.text}")
+            finally:
+                port_forward_process.terminate()
+        else:
+            # direct invocation for linux
+            service_url = self._get_service_url(func_id)
+            headers = {'Content-Type': 'application/json', 'Host': f"{func_id}.{self.namespace}.{self.domain}"}
+            
+            start_time = time.time()
+            response = requests.post(service_url, data=json.dumps(payload), headers=headers, timeout=self.timeout)
             execution_time = time.time() - start_time
             
             if response.status_code == 200:
-                try:
-                    result = response.json()
-                except json.JSONDecodeError:
-                    result = response.text
-                
-                return {
-                    'result': result,
-                    'status': 'success',
-                    'execution_time': execution_time,
-                    'platform': 'knative'
-                }
+                result = response.json() if response.headers.get('content-type', '').startswith('application/json') else response.text
+                return {'result': result, 'status': 'success', 'execution_time': execution_time, 'platform': 'knative'}
             else:
                 raise PlatformError(f"HTTP {response.status_code}: {response.text}")
-                
-        except requests.exceptions.RequestException as e:
-            raise PlatformError(f"Request failed: {e}")
     
     def list_functions(self) -> List[Dict[str, Any]]:
-        """List all deployed Knative services"""
+        """List all deployed functions.
+        
+        Returns:
+            List of function information.
+            
+        Raises:
+            PlatformError: If listing fails.
+        """
         result = self._run_command([
             'service', 'list', '--namespace', self.namespace, '--output', 'json'
         ])
@@ -174,7 +246,17 @@ class KnativePlatform(FaasPlatform):
         return middleware_functions
     
     def delete_function(self, func_id: str) -> Dict[str, Any]:
-        """Delete a deployed Knative service"""
+        """Delete deployed function.
+        
+        Args:
+            func_id: Function identifier.
+            
+        Returns:
+            Deletion result with status.
+            
+        Raises:
+            PlatformError: If deletion fails.
+        """
         result = self._run_command([
             'service', 'delete', func_id,
             '--namespace', self.namespace,

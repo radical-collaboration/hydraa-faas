@@ -23,7 +23,8 @@ install_kn_cli() {
     
     log "installing kn CLI"
     
-    if [[ "$OSTYPE" == "darwin"* ]]; then #mac
+    if [[ "$OSTYPE" == "darwin"* ]]; then # macos
+        log "installing kn CLI for macOS"
         if command -v brew &>/dev/null; then
             run brew install knative/client/kn
         else
@@ -32,8 +33,8 @@ install_kn_cli() {
             run chmod +x /tmp/kn
             run sudo mv /tmp/kn /usr/local/bin/
         fi
-    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then #linux
-        log "downloading kn CLI for Linux"
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then # linux
+        log "installing kn CLI for Linux"
         run curl -L "https://github.com/knative/client/releases/download/knative-v1.12.0/kn-linux-amd64" -o /tmp/kn
         run chmod +x /tmp/kn
         run sudo mv /tmp/kn /usr/local/bin/
@@ -49,6 +50,15 @@ install_kn_cli() {
 }
 
 main() {
+    # detect platform
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        log "detected macos"
+        IS_MACOS=true
+    else
+        log "detected linux"
+        IS_MACOS=false
+    fi
+
     # check dependencies
     minikube status &>/dev/null || error "minikube not running, run install_minikube.sh first"
     log "minikube dependency met"
@@ -82,10 +92,7 @@ main() {
     
     # install kn CLI
     install_kn_cli
-    
-    log "knative installation complete"
-    log "domain configured - ${MINIKUBE_IP}.nip.io"
-    log "test with -  kn service list"
+    echo "knative installation complete"
 }
 
 main

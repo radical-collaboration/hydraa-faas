@@ -1,4 +1,4 @@
-"""Docker utilities"""
+"""Docker utilities for container management."""
 
 import os
 import subprocess
@@ -10,15 +10,15 @@ logger = logging.getLogger(__name__)
 
 
 class DockerError(Exception):
-    """Custom exception for docker related errors"""
+    """Exception for docker errors."""
     
     def __init__(self, message: str, command: str = "", exit_code: int = -1):
-        """Initialize Docker error
+        """Initialize docker error.
         
         Args:
-            message: Error message
-            command: Failed command
-            exit_code: Process exit code
+            message: Error message.
+            command: Failed command.
+            exit_code: Process exit code.
         """
         self.message = message
         self.command = command
@@ -27,13 +27,13 @@ class DockerError(Exception):
 
 
 class DockerUtils:
-    """Utility class for Docker operations."""
+    """Utility class for docker operations."""
     
     def __init__(self):
-        """Initialize docker utilities
+        """Initialize docker utilities.
         
         Raises:
-            DockerError: If Docker is not available
+            DockerError: If docker is not available.
         """
         self.docker_cmd = os.getenv('DOCKER_CMD', 'docker')
         self.timeout = int(os.getenv('DOCKER_TIMEOUT', '300'))
@@ -41,10 +41,10 @@ class DockerUtils:
         logger.info("Docker utilities initialized")
     
     def _validate_docker(self):
-        """Validate docker availability
+        """Validate docker availability.
         
         Raises:
-            DockerError: If Docker is not available or running
+            DockerError: If docker is not available or running.
         """
         try:
             result = self._run_command(['version', '--format', '{{.Server.Version}}'])
@@ -57,17 +57,17 @@ class DockerUtils:
             raise
     
     def _run_command(self, args: List[str], cwd: Optional[str] = None) -> subprocess.CompletedProcess:
-        """Run docker command
+        """Run docker command.
         
         Args:
-            args: Docker command arguments
-            cwd: Working directory
+            args: Docker command arguments.
+            cwd: Working directory.
             
         Returns:
-            Completed process result
+            Completed process result.
             
         Raises:
-            DockerError: If command fails
+            DockerError: If command fails.
         """
         cmd = [self.docker_cmd] + args
         
@@ -89,20 +89,20 @@ class DockerUtils:
     def build_image(self, build_context: str, image_name: str, 
                    dockerfile: str = "Dockerfile", build_args: Optional[Dict[str, str]] = None,
                    no_cache: bool = False) -> Dict[str, Any]:
-        """Build docker image
+        """Build docker image.
         
         Args:
-            build_context: Path to build context directory
-            image_name: Name and tag for the image
-            dockerfile: Dockerfile name
-            build_args: Build arguments
-            no_cache: Whether to disable build cache
+            build_context: Path to build context.
+            image_name: Image name and tag.
+            dockerfile: Dockerfile name.
+            build_args: Build arguments.
+            no_cache: Disable build cache.
             
         Returns:
-            Build result information
+            Build result with image name and status.
             
         Raises:
-            DockerError: If build fails
+            DockerError: If build fails.
         """
         build_context_path = Path(build_context).resolve()
         
@@ -130,46 +130,46 @@ class DockerUtils:
         return {'image_name': image_name, 'status': 'success'}
     
     def push_image(self, image_name: str) -> Dict[str, Any]:
-        """Push docker image to registry
+        """Push docker image to registry.
         
         Args:
-            image_name: Name and tag of image to push
+            image_name: Image name and tag.
             
         Returns:
-            Push result information
+            Push result with image name and status.
             
         Raises:
-            DockerError: If push fails
+            DockerError: If push fails.
         """
         logger.info(f"Pushing Docker image: {image_name}")
         self._run_command(['push', image_name])
         return {'image_name': image_name, 'status': 'success'}
     
     def tag_image(self, source_image: str, target_image: str) -> Dict[str, Any]:
-        """Tag docker image
+        """Tag docker image.
         
         Args:
-            source_image: Source image name and tag
-            target_image: Target image name and tag
+            source_image: Source image name.
+            target_image: Target image name.
             
         Returns:
-            Tag result information
+            Tag result with source, target, and status.
             
         Raises:
-            DockerError: If tagging fails
+            DockerError: If tagging fails.
         """
         logger.info(f"Tagging image {source_image} as {target_image}")
         self._run_command(['tag', source_image, target_image])
         return {'source_image': source_image, 'target_image': target_image, 'status': 'success'}
     
     def check_image_exists(self, image_name: str) -> bool:
-        """Check if docker image exists locally
+        """Check if docker image exists locally.
         
         Args:
-            image_name: Name and tag of image to check
+            image_name: Image name and tag.
             
         Returns:
-            True if image exists
+            True if image exists.
         """
         try:
             self._run_command(['inspect', image_name])
@@ -178,17 +178,17 @@ class DockerUtils:
             return False
     
     def remove_image(self, image_name: str, force: bool = False) -> Dict[str, Any]:
-        """Remove docker image
+        """Remove docker image.
         
         Args:
-            image_name: Name and tag of image to remove
-            force: Whether to force removal
+            image_name: Image name and tag.
+            force: Force removal.
             
         Returns:
-            Removal result information
+            Removal result with image name and status.
             
         Raises:
-            DockerError: If removal fails
+            DockerError: If removal fails.
         """
         cmd_args = ['rmi']
         if force:

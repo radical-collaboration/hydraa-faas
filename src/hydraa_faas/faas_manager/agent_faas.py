@@ -1,10 +1,15 @@
-import requests
-import threading
-import queue
-import radical.utils as ru
+"""
+Agent faas provider
+"""
+
+from hydraa import Task
 
 class AgentFaas:
     """
-    Manages interactions with a faas middleware agent.
-    This class is used for tasks where provider is 'agent'. 
+    Agent based faas provider.
+    
+    This provider integrates with the local faas middleware agent that
+    supports platforms like knative and nuclio.
     """
+    
+    

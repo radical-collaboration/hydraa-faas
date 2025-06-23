@@ -1,11 +1,6 @@
 # Local FaaS Agent (radical faas)
 
-A light weight agent that acts as an intermediare between a user and one of the following FaaS platfroms 
-
-### Nuclio
-- **Description**: high performance serverless platform for data processing
-- **Use cases**: real time data processing, IoT applications, ML inference
-- **Features**: GPU support, data binding, high throughput processing
+A lightweight agent that acts as an intermediate between a user and Knative serverless platform.
 
 ### Knative
 - **Description**: kubernetes based serverless platform with auto scaling
@@ -14,7 +9,7 @@ A light weight agent that acts as an intermediare between a user and one of the 
 
 ## Architecture
 
-The FaaS agent uses **adapters** to provide platform agnostic function deployment and management. The architecture consists of three main layers
+The FaaS agent uses **adapters** to provide platform agnostic function deployment and management. The architecture consists of three main layers:
 
 ```
              ┌─────────────────────────┐
@@ -28,18 +23,17 @@ The FaaS agent uses **adapters** to provide platform agnostic function deploymen
 │                 Platform Adapters                        │
 │                    (base.py)                             │
 ├─────────────────────────┼────────────────────────────────┤
-│     Knative Adapter     │         Nuclio Adapter         │
-│     (knative.py)        │         (nuclio.py)            │
+│     Knative Adapter     │         Docker Utils           │
+│     (knative.py)        │      (docker_utils.py)         │
 └─────────────────────────┼────────────────────────────────┘
                           │
         ┌─────────────────┼─────────────────┐
         │                 │                 │
 ┌───────▼──────┐ ┌────────▼────────┐ ┌──────▼───────┐
-│   Knative    │ │     Nuclio      │ │    Docker    │
-│   Serving    │ │    Functions    │ │   Registry   │
+│   Knative    │ │    Docker       │ │   Container  │
+│   Serving    │ │    Engine       │ │   Registry   │
 └──────────────┘ └─────────────────┘ └──────────────┘
 ```
-
 
 ## Setup
 
@@ -47,60 +41,69 @@ The FaaS agent uses **adapters** to provide platform agnostic function deploymen
 git clone https://github.com/radical-collaboration/hydraa_faas
 cd hydraa_faas/agent
 
-# Create and activate virtual environment
-
+# create and activate virtual environment
 python3 -m venv venv
 source venv/bin/activate  
 
-# Install dependencies
+# install dependencies
 pip install -r requirements.txt
 ```
 
 ### Infrastructure setup
 
+#### Linux
+
 ```bash
-# Make scripts executable
+# make scripts executable
 chmod +x scripts/*.sh
 
-# Install and start docker (if not already running)
+# install and start docker (if not already running)
 ./scripts/install_docker.sh
 
-# Apply the group changes immediately (or you can log out the ec2 and back in)
+# apply the group changes immediately (can log out the ec2 and back in)
 newgrp docker
 
-# Install and start minikube
+# install and start minikube
 ./scripts/install_minikube.sh
 
-# Install your preferred platform
+# install Knative
 ./scripts/install_knative.sh
-#or
-./scripts/install_nuclio.sh
+```
+
+#### MacOS
+
+```bash
+# make scripts executable
+chmod +x scripts/*.sh
+
+# install docker desktop (if not already installed)
+./scripts/install_docker.sh
+
+# install minikube and tools
+./scripts/install_minikube.sh
+
+# install knative
+./scripts/install_knative.sh
 ```
 
 ### Configure environment
 
+#### Linux
 ```bash
-# Configure docker to use minikubes daemon
+# configure docker to use minikubes daemon
 eval $(minikube docker-env)
 
-# Add current user to docker group
+# add current user to docker group
 sudo usermod -aG docker $USER
 
-# Apply the group changes immediately
+# apply the group changes immediately
 newgrp docker
+```
 
-# Create .env file for knative (or you can just export them manually from the configuration examples below this)
-cat > .env << EOF
-FAAS_WORKFLOW=local
-RADICAL_FAAS_PLATFORM=knative
-KNATIVE_DOMAIN=$(minikube ip).nip.io
-KNATIVE_NAMESPACE=default
-FLASK_DEBUG=true
-PORT=5000
-EOF
-
-# Load environment variables
-export $(cat .env | xargs)
+#### MacOS
+```bash
+# configure docker to use minikubes daemon
+eval $(minikube docker-env)
 ```
 
 ### Start agent
@@ -114,15 +117,15 @@ The agent will be available at `http://localhost:5000`
 ### Test setup
 
 ```bash
-# Health check
+# health check
 curl http://localhost:5000/health
 
-# Deploy a test function
+# deploy a test function
 curl -X POST http://localhost:5000/deploy \
   -H "Content-Type: application/json" \
   -d '{"id": "hello-world", "handler": "def handle(req):\n    return \"Hello, World!\""}'
 
-# Invoke the function
+# invoke the function
 curl -X POST http://localhost:5000/invoke \
   -H "Content-Type: application/json" \
   -d '{"id": "hello-world", "payload": {}}'
@@ -130,12 +133,12 @@ curl -X POST http://localhost:5000/invoke \
 
 ## Configuration (environment variables)
 
-#### Core configuration
+#### General configuration
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
 | `FAAS_WORKFLOW` | deployment workflow (`local` or `registry`) | `local` | no |
-| `RADICAL_FAAS_PLATFORM` | target platform (`knative`, `nuclio`) | `knative` | no |
+| `RADICAL_FAAS_PLATFORM` | target platform (only `knative` supported) | `knative` | no |
 | `RADICAL_FAAS_REGISTRY` | container registry URL | - | Yes (if `registry` workflow) |
 | `DOCKER_REPO_PREFIX` | docker repository prefix | `library` | no |
 | `PORT` | flask server port | `5000` | no |
@@ -145,20 +148,10 @@ curl -X POST http://localhost:5000/invoke \
 
 | Variable | Description | Default | Required |
 |----------|-------------|---------|----------|
-| `KNATIVE_DOMAIN` | kative domain for function URLs | `example.com` | Yes |
+| `KNATIVE_DOMAIN` | knative domain for function URLs | `example.com` | Yes |
 | `KNATIVE_NAMESPACE` | kubernetes namespace | `default` | no |
 | `KNATIVE_TIMEOUT` | command timeout (seconds) | `60` | no |
 | `KNATIVE_CLI_PATH` | path to kn CLI binary | `kn` | no |
-
-#### Nuclio configuration
-
-| Variable | Description | Default | Required |
-|----------|-------------|---------|----------|
-| `NUCLIO_NAMESPACE` | nuclio namespace | `nuclio` | no |
-| `NUCLIO_PLATFORM_KIND` | platform type (`kube` or `local`) | `kube` | no |
-| `NUCLIO_TIMEOUT` | command timeout (seconds) | `60` | no |
-| `NUCLIO_CLI_PATH` | path to nuctl CLI binary | `nuctl` | no |
-| `NUCLIO_DASHBOARD_URL` | nuclio dashboard URL | - | no |
 
 #### Docker configuration
 
@@ -169,7 +162,7 @@ curl -X POST http://localhost:5000/invoke \
 
 ### Configuration examples
 
-#### Local (knative)
+#### Local
 ```bash
 export FAAS_WORKFLOW=local
 export RADICAL_FAAS_PLATFORM=knative
@@ -185,15 +178,6 @@ export RADICAL_FAAS_PLATFORM=knative
 export RADICAL_FAAS_REGISTRY=your-registry.com/your-namespace
 export KNATIVE_DOMAIN=your-production-domain.com
 export KNATIVE_NAMESPACE=production
-```
-
-#### Local (nuclio)
-```bash
-export FAAS_WORKFLOW=local
-export RADICAL_FAAS_PLATFORM=nuclio
-export NUCLIO_NAMESPACE=nuclio
-export NUCLIO_PLATFORM_KIND=kube
-export FLASK_DEBUG=true
 ```
 
 ## API
@@ -217,12 +201,12 @@ Check agent health and configuration status.
 
 **POST** `/deploy`
 
-Deploy a Python function to the configured FaaS platform.
+Deploy a Python function to Knative.
 
 **Request Body:**
 ```json
 {
-  "id": "function-name",           // optional (will be generated if not providede)
+  "id": "function-name",           // optional (will be generated if not provided)
   "handler": "def handle(req):\n    return f'Hello {req}'",  // required
   "requirements": "requests==2.31.0\nnumpy==1.24.0",       // optional
   "params": {                      // optional dockerfile template parameters
@@ -283,7 +267,7 @@ Invoke a deployed function with optional payload.
 
 **GET** `/functions`
 
-List all deployed functions (if supported by platform)
+List all deployed functions
 
 **Response:**
 ```json
@@ -292,8 +276,7 @@ List all deployed functions (if supported by platform)
     {
       "id": "function-name",
       "image": "library/function-name:latest",
-      "ready": true,               // knative only
-      "state": "ready",            // nuclio only
+      "ready": true,
       "platform": "knative"
     }
   ]
@@ -302,7 +285,6 @@ List all deployed functions (if supported by platform)
 
 **Status Codes:**
 - `200`: Functions listed successfully
-- `501`: Function listing not supported by platform
 - `500`: Listing failed
 
 ## Examples
@@ -346,7 +328,7 @@ curl -X POST http://localhost:5000/invoke \
   }'
 ```
 
-### Data processing functione
+### Data processing function
 
 ```bash
 curl -X POST http://localhost:5000/deploy \
@@ -407,9 +389,35 @@ curl -X POST http://localhost:5000/deploy \
 
 ## Troubleshooting
 
-Errors i encountered while testing
+### Platform-Specific Issues
 
-#### Docker permission denied
+#### MacOS
+
+**Issue**: Connection timeout to minikube IP
+```
+Connection to 192.168.49.2 timed out. (connect timeout=300)
+```
+
+**Solutions**:
+1. **Use minikube tunnel** (recommended):
+   ```bash
+   # In a separate terminal:
+   minikube tunnel
+   ```
+
+2. **Restart Docker Desktop**:
+   ```bash
+   # Stop and start Docker Desktop
+   # Then restart minikube
+   minikube stop && minikube start
+   ```
+
+3. **Check Docker Desktop settings**:
+   - Ensure Docker Desktop is running
+   - Verify Kubernetes is enabled in Docker Desktop settings
+
+#### Linux
+
 **Error**: `permission denied while trying to connect to the docker daemon socket`
 
 **Solution**:
@@ -423,6 +431,8 @@ newgrp docker
 # verify docker access
 docker run hello-world
 ```
+
+### General issues
 
 #### Minikube docker environment not set
 **Error**: images not found during deployment type of errors
@@ -447,15 +457,12 @@ echo $DOCKER_HOST
 # check platform logs (knative)
 kubectl logs -n knative-serving -l app=controller --tail=50
 
-# check platform logs (nuclio)
-kubectl logs -n nuclio -l app=nuclio-controller --tail=50
-
 # check function-specific logs
 kubectl logs -n default -l serving.knative.dev/service=FUNCTION_NAME
 ```
 
 #### Image pull errors
-**Error**: `ImagePullBackOff` or somthing very close to this
+**Error**: `ImagePullBackOff` or something very close to this
 
 **Solutions**:
 - **Local**: ensure `eval $(minikube docker-env)` is executed
@@ -467,13 +474,11 @@ kubectl logs -n default -l serving.knative.dev/service=FUNCTION_NAME
 
 **Solutions**:
 ```bash
-# increase timeout values (usually not the best fix but it helped once)
+# increase timeout values
 export KNATIVE_TIMEOUT=120
-export NUCLIO_TIMEOUT=120
 
 # check if services are ready
-kubectl get ksvc  # knative
-nuctl get functions  # nuclio
+kubectl get ksvc
 ```
 
 #### Port conflicts
@@ -484,6 +489,6 @@ nuctl get functions  # nuclio
 # change agent port
 export PORT=5001
 
-# or kill existing processes (becareful as you can kill somthing important, i killed airdrop on my mac for example)
+# or kill existing processes (be careful as you can kill something important)
 lsof -ti:5000 | xargs kill -9
 ```
