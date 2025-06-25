@@ -79,8 +79,8 @@ main() {
     fi
     echo "docker environment configured"
 
-    # Login to Docker Hub via Minikube's Docker daemon
-    echo "please enter your docker hub username:"
+    # login to docker hub via minikubes docker daemon
+    echo "enter your docker hub username:"
     read DOCKER_USERNAME
     echo -n "please enter your docker hub password:"
     read -s DOCKER_PASSWORD
@@ -109,7 +109,7 @@ main() {
     --username admin --password-stdin \
     --gateway http://127.0.0.1:8080
 
-    echo "Setting environment variables for app.py in current shell session..."
+    echo "setting environment variables for app.py in current shell session"
     
 
     export OPENFAAS_USERNAME="admin"
