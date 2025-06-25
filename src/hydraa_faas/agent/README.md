@@ -1,6 +1,6 @@
 # Local FaaS Agent (radical faas)
 
-A lightweight agent that acts as an intermediate between a user and Knative serverless platform.
+A lightweight agent that acts as an intermediate between a user and Knative serverless platform. Scripts and platform adapters for OpenFaaS CE (limited for developer testing) and Nuclio are provided for future work.
 
 ### Knative
 - **Description**: kubernetes based serverless platform with auto scaling
