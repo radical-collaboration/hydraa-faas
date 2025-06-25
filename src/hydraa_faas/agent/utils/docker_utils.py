@@ -1,8 +1,9 @@
 """Docker utilities for container management."""
 
+import logging
 import os
 import subprocess
-import logging
+
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 
