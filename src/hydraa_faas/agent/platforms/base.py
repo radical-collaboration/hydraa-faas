@@ -1,7 +1,7 @@
 """Knative platform base classes."""
 
-import os
 import time
+
 from abc import ABC, abstractmethod
 from typing import Dict, Any, List
 

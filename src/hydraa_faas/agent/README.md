@@ -9,7 +9,7 @@ A lightweight agent that acts as an intermediate between a user and Knative serv
 
 ## Architecture
 
-The FaaS agent uses **adapters** to provide platform agnostic function deployment and management. The architecture consists of three main layers:
+The FaaS agent uses **adapters** to provide platform-agnostic function deployment and management. The architecture consists of three main layers:
 
 ```
              ┌─────────────────────────┐
