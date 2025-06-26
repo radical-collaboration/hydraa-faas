@@ -18,7 +18,7 @@ mocks = [
 for mock_name in mocks:
     sys.modules[mock_name] = MagicMock()
 
-import manager
+from src.hydraa_faas.faas_manager import manager
 
 class MockTask:
     def __init__(self):
