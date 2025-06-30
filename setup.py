@@ -1,6 +1,7 @@
 from setuptools import setup, find_packages
 
-# read requiremnets.txt
+with open('requirements.txt', encoding='utf-8') as freq:
+    requirements = freq.readlines()
 
 setup_args = {}
 
@@ -13,7 +14,7 @@ setup_args['scripts']              = ['src/hydraa_faas/agent/scripts/install_min
                                       'src/hydraa_faas/agent/scripts/install_knative.sh']
 setup_args['packages']             = find_packages()
 setup_args['package_data']         = {'': ['*.sh', '*.yaml'],}
-setup_args['python_requires']      = '>=3.6'
-setup_args['install_requires']     = []
+setup_args['python_requires']      = '>=3.9'
+setup_args['install_requires']     = requirements
 
 setup(**setup_args)

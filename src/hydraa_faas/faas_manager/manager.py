@@ -11,7 +11,7 @@ import queue
 import asyncio
 import threading as mt
 import radical.utils as ru
-from typing import Callable, List, Union, Dict
+from typing import Callable, List, Union, Dict, Any
 from collections import OrderedDict
 from hydraa import Task
 from hydraa.providers.proxy import proxy
