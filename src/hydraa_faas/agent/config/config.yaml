@@ -1,0 +1,48 @@
+# agent configuration
+
+# ["knative", "nuclio"]
+Port: 8000
+platform: "nuclio"
+kubernetes_target:
+  # [kind, minikube, docker-desktop, eks, gke, aks, openshift, kubernetes]
+  type: "minikube"
+  # ~/.kube/config or in cluster authentication if deployed inside kubernetes
+  # if this is commented out the agent will try standard locations
+  kubeconfig_path: "/home/ec2-user/.kube/config"
+  # the name of the context to use from your kubeconfig file
+  # if this is commented out the agent will use the current default context
+  context_name: "minikube"
+
+# platform specs
+platforms:
+  knative:
+    container_registry: "docker.io/husseinmohab"
+    namespace: "default"
+    builder_namespace: "default"
+    spec:
+      template:
+        metadata:
+          annotations:
+            autoscaling.knative.dev/minScale: "1"
+            autoscaling.knative.dev/maxScale: "100"
+            autoscaling.knative.dev/target: "10"
+
+  nuclio:
+    container_registry: "docker.io/husseinmohab"
+    namespace: "nuclio"
+    function_defaults:
+      spec:
+        env:
+          - name: "LOG_LEVEL"
+            value: "INFO"
+        triggers:
+          default_http:
+            kind: "http"
+            maxWorkers: 2
+        resources:
+          limits:
+            cpu: "1000m"
+            memory: "512Mi"
+          requests:
+            cpu: "100m"
+            memory: "128Mi"
