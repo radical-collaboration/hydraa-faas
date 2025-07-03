@@ -4,8 +4,9 @@ Quick examples for deploying lambda functions with the hydraa faas manager.
 
 ## Notebooks
 
-- **`basic_lambda_deployment.ipynb`** - deploy 10 source-based lambda functions
-- **`ecr_lambda_deployment.ipynb`** - deploy 5 containerized lambda functions
+- `agent_examples.ipynb`: demonstrates deploying functions to the agent provider, both from inline code and from local source directories.
+- `basic_lambda_deployment.ipynb`: demonstrates deploying multiple source-based (zip) functions to aws lambda.
+- `ecr_lambda_deployment.ipynb`: demonstrates deploying container-based functions to aws lambda using ecr.
 
 ## Setup
 
@@ -18,9 +19,17 @@ Quick examples for deploying lambda functions with the hydraa faas manager.
    # for container example  
    cd container_functions
    python create_container_project.py
+   
+   # for agent example
+   cd agent_functions
+   python create_agent_functions.py
    ```
 
-2. set aws credentials in `.env`:
+2. Install the project and its dependencies. from the root directory, run:
+    ```bash
+    pip install -e .
+    ```
+3. Set aws credentials in `.env`:
    ```
    cat > .env_private <<EOF
    ACCESS_KEY_ID=your_key
@@ -31,4 +40,5 @@ Quick examples for deploying lambda functions with the hydraa faas manager.
    export $(cat .env_private | xargs)
    ```
 
-3. Run notebooks
+4. Run the jupyter notebooks to see the examples in action.
+

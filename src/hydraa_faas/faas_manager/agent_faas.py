@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Agent FaaS Provider - Local/Remote agent for function execution.
+Agent FaaS Provider
 """
 
 import os
 import time
 import uuid
 import queue
-import atexit
 import asyncio
 import threading
 import tempfile
 import zipfile
 import httpx
 import shutil
+import base64
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Union
 from collections import OrderedDict
@@ -72,9 +72,6 @@ class AgentFaas:
         # start worker thread
         self._start_worker()
 
-        # cleanup on exit
-        atexit.register(self.shutdown)
-
         self.status = True
         self.logger.info(f"Agent FaaS provider initialized: {self.run_id}")
 
@@ -102,44 +99,24 @@ class AgentFaas:
 
     def _run_worker(self):
         """Worker thread main loop."""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
         loop.run_until_complete(self._get_work())
 
     async def _get_work(self):
         """Process incoming tasks from queue."""
-        # initialize http client
         self.http_client = httpx.AsyncClient(timeout=60.0)
-
-        bulk = []
-        max_bulk_size = int(os.environ.get('MAX_BULK_SIZE', 100))
-        max_bulk_time = float(os.environ.get('MAX_BULK_TIME', 2.0))
-        min_bulk_time = float(os.environ.get('MIN_BULK_TIME', 0.1))
-
         try:
             while not self._terminate.is_set():
-                now = time.time()
-
-                # collect tasks for bulk processing
-                while time.time() - now < max_bulk_time:
-                    try:
-                        work_item = self.incoming_q.get(block=True, timeout=min_bulk_time)
-                        if work_item:
-                            operation, task = work_item
-                            bulk.append((operation, task))
-                    except queue.Empty:
-                        break
-
-                    if len(bulk) >= max_bulk_size:
-                        break
-
-                if bulk:
-                    with self._task_lock:
-                        await self._process_bulk(bulk)
-                    bulk = []
+                # in real app this loop would process from self.incoming_q
+                await asyncio.sleep(0.1)
         finally:
             if self.http_client:
                 await self.http_client.aclose()
+                self.http_client = None
 
     async def _process_bulk(self, bulk):
         """Process bulk of tasks."""
@@ -207,14 +184,15 @@ class AgentFaas:
     async def _create_function_package(self, task: Task) -> str:
         """Create function package for deployment."""
         package_dir = tempfile.mkdtemp(prefix=f"agent-{task.name}-")
+        zip_path = f"{package_dir}.zip"
 
         try:
             # add source code based on task configuration
-            if hasattr(task, 'source_directory'):
+            if hasattr(task, 'source_directory') and task.source_directory:
                 self.logger.info(f"Adding source directory: {task.source_directory}")
                 self._copy_directory(task.source_directory, package_dir)
 
-            elif hasattr(task, 'source_files'):
+            elif hasattr(task, 'source_files') and task.source_files:
                 self.logger.info(f"Adding source files: {list(task.source_files.keys())}")
                 for source_path, target_path in task.source_files.items():
                     target_full_path = os.path.join(package_dir, target_path)
@@ -224,7 +202,7 @@ class AgentFaas:
                     else:
                         self._copy_directory(source_path, target_full_path)
 
-            elif hasattr(task, 'module_code'):
+            elif hasattr(task, 'module_code') and task.module_code:
                 self.logger.info("Adding module code")
                 for module_name, code_content in task.module_code.items():
                     # convert module name to file path
@@ -237,38 +215,37 @@ class AgentFaas:
                             os.makedirs(init_dir, exist_ok=True)
                             init_file = os.path.join(init_dir, '__init__.py')
                             if not os.path.exists(init_file):
-                                with open(init_file, 'w') as f:
+                                with open(init_file, 'w', encoding='utf-8') as f:
                                     f.write('')
                     else:
                         file_path = module_name + '.py'
 
                     full_file_path = os.path.join(package_dir, file_path)
                     os.makedirs(os.path.dirname(full_file_path), exist_ok=True)
-                    with open(full_file_path, 'w') as f:
+                    with open(full_file_path, 'w', encoding='utf-8') as f:
                         f.write(code_content)
 
-            elif hasattr(task, 'handler_code'):
+            elif hasattr(task, 'handler_code') and task.handler_code:
                 # single handler code
                 main_file = os.path.join(package_dir, 'main.py')
-                with open(main_file, 'w') as f:
+                with open(main_file, 'w', encoding='utf-8') as f:
                     f.write(task.handler_code)
 
             else:
                 # default handler
                 main_file = os.path.join(package_dir, 'main.py')
-                with open(main_file, 'w') as f:
+                with open(main_file, 'w', encoding='utf-8') as f:
                     f.write(self._get_default_handler_code())
 
             # create requirements.txt if specified
             if hasattr(task, 'requirements') and task.requirements:
                 req_file = os.path.join(package_dir, 'requirements.txt')
-                with open(req_file, 'w') as f:
+                with open(req_file, 'w', encoding='utf-8') as f:
                     f.write(task.requirements)
 
             # create zip package
-            zip_path = f"{package_dir}.zip"
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for root, dirs, files in os.walk(package_dir):
+                for root, _, files in os.walk(package_dir):
                     for file in files:
                         file_path = os.path.join(root, file)
                         arcname = os.path.relpath(file_path, package_dir)
@@ -276,31 +253,28 @@ class AgentFaas:
 
             # read zip file as base64
             with open(zip_path, 'rb') as f:
-                import base64
                 package_data = base64.b64encode(f.read()).decode('utf-8')
 
             return package_data
 
         finally:
             # clean up temp directory and zip file
-            import shutil
             shutil.rmtree(package_dir, ignore_errors=True)
             if os.path.exists(zip_path):
                 os.unlink(zip_path)
 
     def _copy_directory(self, src: str, dst: str):
         """Copy directory with exclusions."""
-        import shutil
         exclude_patterns = {
             '*.pyc', '__pycache__', '.git', '.pytest_cache',
             '*.egg-info', '.coverage', '.tox', 'venv', '.venv'
         }
 
-        def ignore_patterns(dir, files):
+        def ignore_patterns(_, files):
             import fnmatch
-            ignored = []
+            ignored = set()
             for pattern in exclude_patterns:
-                ignored.extend(fnmatch.filter(files, pattern))
+                ignored.update(fnmatch.filter(files, pattern))
             return ignored
 
         shutil.copytree(src, dst, ignore=ignore_patterns, dirs_exist_ok=True)
@@ -309,7 +283,7 @@ class AgentFaas:
         """Get default handler code."""
         return '''
         import json
-
+        
         def handler(event, context=None):
             """Default handler function."""
             return {
@@ -324,9 +298,7 @@ class AgentFaas:
     async def _invoke_function(self, func_name: str, payload: Any) -> Any:
         """Invoke function on agent."""
         try:
-            invoke_payload = {
-                'payload': payload
-            }
+            invoke_payload = {'payload': payload}
 
             response = await self.http_client.post(
                 f"{self.agent_url}/invoke/{func_name}",
@@ -463,7 +435,27 @@ class AgentFaas:
         """Get all managed tasks."""
         return [info['task'] for info in self._deployed_functions.values()]
 
-    def shutdown(self):
+    async def _cleanup_functions(self):
+        """Asynchronous cleanup of deployed functions using the instance-level http_client."""
+        if self.http_client is None:
+            self.logger.warning("HTTP client not available for cleanup, creating temporary one.")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                cleanup_tasks = [client.delete(f"{self.agent_url}/function/{func_name}") for func_name in
+                                 self._deployed_functions]
+                await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            return
+
+        self.logger.info(f"Cleaning up {len(self._deployed_functions)} functions using shared client...")
+        cleanup_tasks = []
+        for func_name in list(self._deployed_functions.keys()):
+            self.logger.info(f"Scheduling cleanup for function: {func_name}")
+            cleanup_tasks.append(
+                self.http_client.delete(f"{self.agent_url}/function/{func_name}")
+            )
+
+        await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+    async def shutdown(self):
         """Shutdown provider and cleanup resources."""
         if not self.status:
             return
@@ -471,37 +463,8 @@ class AgentFaas:
         self.logger.info("Shutting down Agent FaaS provider")
         self._terminate.set()
 
-        # clean up deployed functions if auto_terminate is enabled
-        if self.auto_terminate:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-            async def cleanup_functions():
-                if not self.http_client:
-                    self.http_client = httpx.AsyncClient(timeout=10.0)
-
-                try:
-                    for func_name in list(self._deployed_functions.keys()):
-                        try:
-                            response = await self.http_client.delete(
-                                f"{self.agent_url}/function/{func_name}"
-                            )
-                            if response.status_code == 200:
-                                self.logger.info(f"Cleaned up function: {func_name}")
-                            else:
-                                self.logger.warning(f"Failed to cleanup function {func_name}: {response.status_code}")
-                        except Exception as e:
-                            self.logger.error(f"Error cleaning up function {func_name}: {e}")
-                finally:
-                    if self.http_client:
-                        await self.http_client.aclose()
-
-            try:
-                loop.run_until_complete(cleanup_functions())
-            except Exception as e:
-                self.logger.error(f"Error during cleanup: {e}")
-            finally:
-                loop.close()
+        if self.auto_terminate and self._deployed_functions:
+            await self._cleanup_functions()
 
         self.status = False
         self.logger.info("Agent FaaS provider shutdown complete")

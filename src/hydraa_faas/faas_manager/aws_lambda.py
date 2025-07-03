@@ -1,5 +1,5 @@
 """
-AWS Lambda provider implementation for FaaS Manager
+AWS Lambda provider
 """
 
 import os
@@ -16,13 +16,11 @@ from datetime import datetime
 from collections import OrderedDict
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
 import boto3
 from botocore.exceptions import ClientError
-
-from utils.packaging import create_deployment_package, validate_handler, estimate_package_size
-from utils.ecr_helper import ECRHelper
-from exceptions import *
+from ..utils.packaging import create_deployment_package, validate_handler, estimate_package_size
+from ..utils.ecr_helper import ECRHelper
+from ..utils.exceptions import *
 
 # aws lambda constants
 LAMBDA_MAX_TIMEOUT = 900  # 15 minutes
@@ -184,7 +182,7 @@ class AwsLambda:
                 # check if function still exists and is not being invoked
                 response = self._lambda_client.get_function(FunctionName=function_name)
 
-                # for we can just wait a reasonable time
+                # can just wait a reasonable time
                 # in the future i can check cloudwatch metrics for concurrent executions
                 time.sleep(5)
                 break
@@ -634,14 +632,14 @@ class AwsLambda:
         """Get or create IAM execution role for Lambda function"""
         role_name = f'hydraa-lambda-role-{self.manager_id}'
 
-        # Always try to get existing role first
+        # always try to get existing role first
         try:
             response = self._iam_client.get_role(RoleName=role_name)
             role_arn = response['Role']['Arn']
             self._created_resources['iam_roles'][role_name] = role_arn
             self.logger.trace(f'Found existing IAM role: {role_arn}')
 
-            # Make sure required policies are attached
+            # make sure required policies are attached
             try:
                 self._iam_client.attach_role_policy(
                     RoleName=role_name,
@@ -655,7 +653,7 @@ class AwsLambda:
 
         except ClientError as e:
             if e.response['Error']['Code'] != 'NoSuchEntity':
-                # Some other error occurred
+                # some other error occurred
                 self.logger.warning(f'Error checking existing role: {e}')
 
         # create new role
@@ -685,7 +683,7 @@ class AwsLambda:
                 PolicyArn='arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
             )
 
-            # If vpc access is needed, attach vpc execution policy
+            # if vpc access is needed, attach vpc execution policy
             if hasattr(task, 'vpc_config') and task.vpc_config:
                 self._iam_client.attach_role_policy(
                     RoleName=role_name,
@@ -703,18 +701,19 @@ class AwsLambda:
         except ClientError as e:
             raise DeploymentException(f'Failed to create IAM role: {str(e)}')
 
+    # TODO: figure out a better way to do this
     def _wait_for_role_propagation(self, role_arn, max_wait=60):
         """Wait for IAM role to propagate with intelligent polling"""
         for attempt in range(max_wait):
             try:
-                # test role by trying to assume it (dry run)
-                # in practice, we just wait incrementally as role propagation is eventually consistent
+                # test role by trying to assume it
+                # in practice, we just wait incrementally as role setting is eventually consistent
                 time.sleep(min(attempt * 0.5, 3))  # exponential backoff up to 3s
 
-                # simple check - if we can still get the role, it should be ready soon
+                # simple check if we can still get the role
                 self._iam_client.get_role(RoleName=role_arn.split('/')[-1])
 
-                # after 5 attempts (roughly 7.5 seconds), assume it's ready
+                # after 5 attempts (roughly 7.5 seconds), assume it's ready, fix this
                 if attempt >= 5:
                     break
 
@@ -836,7 +835,7 @@ class AwsLambda:
         self.logger.trace("Lambda provider termination started")
         self._terminate.set()
 
-        # Use overall cleanup timeout
+        # use overall cleanup timeout
         try:
             with self._cleanup_timeout_context(self.cleanup_timeout):
                 self._cleanup_in_order()

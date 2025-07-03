@@ -7,7 +7,7 @@ import zipfile
 import tempfile
 import shutil
 from io import BytesIO
-from exceptions import PackagingException
+from .exceptions import PackagingException
 
 DEFAULT_EXCLUDES = [
     '__pycache__',

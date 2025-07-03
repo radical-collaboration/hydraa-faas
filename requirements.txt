@@ -1,7 +1,0 @@
-hydraa @ git+https://github.com/radical-project/radical.dream.git
-radical.utils
-boto3
-httpx
-radical.pilot
-python-blazarclient
-lexicon

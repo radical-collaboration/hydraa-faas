@@ -6,7 +6,7 @@ import os
 import json
 import base64
 import subprocess
-from exceptions import ECRException
+from .exceptions import ECRException
 
 
 class ECRHelper:
@@ -43,7 +43,7 @@ class ECRHelper:
             return repo_uri
 
         except self.ecr_client.exceptions.RepositoryAlreadyExistsException:
-            # repository exists, get its uri
+            # repository exists get its uri
             response = self.ecr_client.describe_repositories(
                 repositoryNames=[repository_name]
             )
@@ -143,19 +143,20 @@ class ECRHelper:
         except Exception as e:
             raise ECRException(f"Failed to build and push image: {str(e)}")
 
+    # TODO: figure out keychain error
     def _docker_login(self, username, password, registry_url):
         """Login to Docker registry with keychain cleanup"""
         import subprocess
 
-        # Clear existing keychain entry to avoid conflicts
+        # clear existing keychain entry to avoid conflicts
         try:
             subprocess.run(['security', 'delete-internet-password', '-s', registry_url],
                            capture_output=True, check=False)
             self.logger.trace(f"Cleared existing keychain entry for {registry_url}")
         except:
-            pass  # Ignore if entry doesn't exist
+            pass  # ignore if entry doesn't exist
 
-        # Now do the normal docker login
+        # now normal docker login
         cmd = ['docker', 'login', '--username', username, '--password-stdin', registry_url]
 
         process = subprocess.Popen(
@@ -175,7 +176,7 @@ class ECRHelper:
 
     def _docker_build(self, source_path, image_uri):
         """Build Docker image with Docker manifest format for Lambda"""
-        # Set environment to disable BuildKit (forces Docker manifest format)
+        # set environment to disable BuildKit (forces Docker manifest format)
         env = os.environ.copy()
         env['DOCKER_BUILDKIT'] = '0'  # This is the key fix!
 
@@ -186,7 +187,7 @@ class ECRHelper:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            env=env  # Forces compatible manifest format
+            env=env  # forces compatible manifest format
         )
 
         stdout, stderr = process.communicate()

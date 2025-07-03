@@ -121,9 +121,9 @@ if __name__ == "__main__":
 def create_requirements_txt():
     """Create requirements.txt for Lambda functions"""
     return """
-    numpy==1.24.3
-    pandas==2.0.3 
-    requests==2.31.0
+    numpy
+    pandas
+    requests
     """
 
 
@@ -146,7 +146,7 @@ def create_config_json(function_id):
 def create_shared_utils():
     """Create shared utilities module"""
     content = '''"""
-shared utilities for lambda functions
+Shared utilities for lambda functions
 """
 
 import json
@@ -191,7 +191,7 @@ def format_response(status_code, data, headers=None):
 
 def main():
     """Create the complete Lambda project structure"""
-    print("creating lambda project for Hydraa FaaS Manager example")
+    print("creating lambda project for hydraa faaS manager example")
 
     # create function directories and files
     for i in range(10):
@@ -226,7 +226,6 @@ def main():
     print(f"   10 function directories (function_0 to function_9)")
     print(f"   30 function files (main.py, requirements.txt, config.json)")
     print(f"   1 shared utilities module")
-    print(f"   1 README file")
 
 if __name__ == "__main__":
     main()

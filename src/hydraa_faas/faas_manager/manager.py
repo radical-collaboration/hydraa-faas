@@ -10,8 +10,9 @@ from typing import Callable, List, Union
 from hydraa import Task
 from hydraa.providers.proxy import proxy
 from hydraa.services.caas_manager.utils import misc
-from aws_lambda import AwsLambda
-from exceptions import FaasException
+from .aws_lambda import AwsLambda
+from .agent_faas import AgentFaas
+from ..utils.exceptions import FaasException
 
 AWS = 'aws'
 LOCAL = 'local'
@@ -19,7 +20,7 @@ AGENT = 'agent'
 
 PROVIDER_TO_CLASS = {
     AWS: AwsLambda,
-    # AGENT: AgentFaas,
+    AGENT: AgentFaas,
 }
 
 TERM_SIGNALS = {

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-container lambda project directory creator for hydraa faas manager ecr examples.
+Container lambda project directory creator for hydraa faas manager ecr examples.
 creates 5 containerized lambda functions with dockerfiles.
 
-usage:
+Usage:
     cd faas_manager/examples/container_functions
     python create_container_project.py
 """
@@ -14,7 +14,7 @@ from pathlib import Path
 
 
 def create_function_app_py(function_id):
-    """create app.py for a specific container function"""
+    """Create app.py for a specific container function"""
     memory_mb = 512 + (function_id * 256)
     processing_type = "image_process" if function_id % 2 == 0 else "data_transform"
 
@@ -26,7 +26,7 @@ from datetime import datetime
 
 def lambda_handler(event, context):
     """
-    container lambda function {function_id} handler for hydraa faas manager
+    Container lambda function {function_id} handler for hydraa faas manager
     """
 
     # container specific configuration
@@ -147,7 +147,7 @@ if __name__ == "__main__":
 
 
 def create_dockerfile(function_id):
-    """create dockerfile for container function"""
+    """Create dockerfile for container function"""
     content = f'''# use aws lambda python base image
 FROM public.ecr.aws/lambda/python:3.9
 
@@ -175,16 +175,16 @@ CMD ["app.lambda_handler"]
 
 def create_requirements_txt():
     """create requirements.txt for container functions"""
-    return """numpy==1.24.3
-pandas==2.0.3
-requests==2.31.0
-pillow==10.0.0
-boto3==1.28.0
+    return """numpy
+pandas
+requests
+pillow
+boto3
 """
 
 
 def create_config_json(function_id):
-    """create config.json for container function"""
+    """Create config.json for container function"""
     config = {
         "function_id": function_id,
         "memory_mb": 512 + (function_id * 256),
@@ -206,9 +206,9 @@ def create_config_json(function_id):
 
 
 def create_utils_helper():
-    """create utils helper for container functions"""
+    """Create utils helper for container functions"""
     content = '''"""
-container-specific utilities for lambda functions
+Container-specific utilities for lambda functions
 """
 
 import json
@@ -217,7 +217,7 @@ import time
 from datetime import datetime
 
 def get_container_info():
-    """get container runtime information"""
+    """Get container runtime information"""
     return {
         'function_id': os.environ.get('FUNCTION_ID', 'unknown'),
         'container_version': os.environ.get('CONTAINER_VERSION', '1.0.0'),
@@ -227,7 +227,7 @@ def get_container_info():
     }
 
 def log_container_execution(function_id, event, duration, result):
-    """container-specific logging format"""
+    """Container-specific logging format"""
     container_info = get_container_info()
 
     log_entry = {
@@ -242,7 +242,7 @@ def log_container_execution(function_id, event, duration, result):
     print(f"container_execution_log: {json.dumps(log_entry)}")
 
 def validate_container_event(event, required_fields=None):
-    """validate container event structure"""
+    """Validate container event structure"""
     if required_fields is None:
         required_fields = ['message', 'data']
 
@@ -253,7 +253,7 @@ def validate_container_event(event, required_fields=None):
     return True
 
 def format_container_response(status_code, data, headers=None):
-    """container-specific response format"""
+    """Container-specific response format"""
     if headers is None:
         headers = {
             'Content-Type': 'application/json',
@@ -274,7 +274,7 @@ def format_container_response(status_code, data, headers=None):
 
 
 def create_dockerignore():
-    """create .dockerignore file"""
+    """Create .dockerignore file"""
     content = '''__pycache__/
 *.pyc
 *.pyo
@@ -294,7 +294,7 @@ tests/
 
 
 def main():
-    """create the complete container project structure"""
+    """Create the complete container project structure"""
     print("creating container lambda project for hydraa faas manager ecr example")
 
     # create container function directories and files
@@ -336,9 +336,6 @@ def main():
     print(f"files created:")
     print(f"   5 container function directories (function_0 to function_4)")
     print(f"   30 container files (dockerfile, app.py, requirements.txt, config.json, .dockerignore, utils)")
-    print(f"   1 readme file")
-    print(f"ready for ecr deployment with parallel container builds")
-
 
 if __name__ == "__main__":
     main()
