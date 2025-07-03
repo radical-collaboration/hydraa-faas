@@ -14,8 +14,7 @@ import zipfile
 import httpx
 import shutil
 import base64
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List
 from collections import OrderedDict
 from hydraa import Task
 

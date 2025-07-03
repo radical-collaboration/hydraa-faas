@@ -3,22 +3,19 @@ AWS Lambda provider
 """
 
 import os
-import re
 import json
 import time
 import uuid
 import queue
-import atexit
 import shutil
 import signal
 import threading
-from datetime import datetime
 from collections import OrderedDict
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import boto3
 from botocore.exceptions import ClientError
-from ..utils.packaging import create_deployment_package, validate_handler, estimate_package_size
+from ..utils.packaging import create_deployment_package, validate_handler
 from ..utils.ecr_helper import ECRHelper
 from ..utils.exceptions import *
 
