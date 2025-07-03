@@ -5,16 +5,5 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "hydraa-faas"
 version = "0.1.0"
-dependencies = [
-    "hydraa @ git+https://github.com/radical-project/radical.dream.git",
-    "radical.utils",
-    "boto3",
-    "httpx",
-    "pytest-asyncio",
-    "radical.pilot",
-    "python-blazarclient",
-    "lexicon"
-]
-
-[tool.setuptools.packages.find]
-where = ["src"]
+dependencies = {file = ["requirements.txt"]}
+[tool.setuptools.dynamic]
