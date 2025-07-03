@@ -7,9 +7,28 @@ on:
     branches: [ main, master, manager ]
 
 jobs:
+  # New job for linting the code
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Pylint
+        run: |
+          python -m pip install --upgrade pip
+          pip install pylint
+
+      - name: Run pylint
+        run: |
+          pylint src/hydraa_faas
   test:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -22,6 +41,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
+          # Your project and its dependencies (including pytest) are installed here
           pip install -e .
 
       - name: Run tests with pytest
