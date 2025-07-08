@@ -36,10 +36,10 @@ chmod +x scripts/*.sh
 # or
 ./scripts/install_nuclio.sh
 
-docker login
 sudo usermod -aG docker $USER
 newgrp docker
 eval $(minikube docker-env)
+docker login
 ```
 for instructions on setting up other environments like Kind or AWS EKS see the detailed tutorial in `examples/`
 
@@ -74,8 +74,10 @@ source venv/bin/activate
 # install dependencies
 pip install -r requirements.txt
 
-# start the agent using uvicorn
+# start the agent using uvicorn (local)
 uvicorn agent.app:app --reload
+# remote
+uvicorn agent.app:app --host 0.0.0.0 --port 8000 --reload
 ```
 the agent API will be available at http://localhost:8000.
 

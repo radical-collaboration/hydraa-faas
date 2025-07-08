@@ -36,40 +36,47 @@ main() {
     command -v helm &>/dev/null || error "helm not found, run install_minikube.sh first"
     log "dependencies met"
 
+    # IMPORTANT: Set up minikube docker environment
+    log "configuring minikube docker environment"
+    eval $(minikube docker-env)
+
     # install nuctl CLI
     command -v nuctl &>/dev/null && log "nuctl already installed" || install_nuctl
 
     # check if already installed
     if helm status nuclio -n nuclio &>/dev/null; then
-        log "nuclio already deployed"
-    else
-        log "installing nuclio via helm"
-        run helm repo add nuclio https://nuclio.github.io/nuclio/charts
-        run helm repo update
-        
-        # create namespace
-        log "creating nuclio namespace"
-        if ! kubectl get namespace nuclio &>/dev/null; then
-            run kubectl create namespace nuclio
-        else
-            log "nuclio namespace already exists"
-        fi
-        
-        run helm install nuclio nuclio/nuclio --namespace nuclio --wait --timeout=300s
+        log "nuclio already deployed, reinstalling for fresh start"
+        run helm uninstall nuclio -n nuclio
+        sleep 10
     fi
+
+    log "installing nuclio via helm"
+    run helm repo add nuclio https://nuclio.github.io/nuclio/charts
+    run helm repo update
+
+    # create namespace
+    log "creating nuclio namespace"
+    if ! kubectl get namespace nuclio &>/dev/null; then
+        run kubectl create namespace nuclio
+    else
+        log "nuclio namespace already exists"
+    fi
+
+    run helm install nuclio nuclio/nuclio --namespace nuclio --wait --timeout=300s
 
     # wait for dashboard
     log "waiting for nuclio dashboard"
     run kubectl rollout status -n nuclio deployment/nuclio-dashboard --timeout=300s
-    
+
     # setup port forwarding
     log "setting up port forwarding"
     pkill -f "port-forward.*nuclio-dashboard" || true
     kubectl -n nuclio port-forward svc/nuclio-dashboard 8070:8070 >/dev/null 2>&1 &
-    
+
     log "nuclio installation complete"
     log "dashboard - http://localhost:8070"
-    log "test with - nuctl get functions"
+    log "IMPORTANT: Remember to run 'eval \$(minikube docker-env)' before deploying functions"
+    log "test with - nuctl get functions --namespace nuclio"
 }
 
 main

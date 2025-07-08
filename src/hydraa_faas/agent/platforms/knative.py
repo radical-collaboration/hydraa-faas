@@ -2,6 +2,8 @@
 
 This implementation builds Docker images from uploaded zip files and deploys them
 using the kn CLI for better networking compatibility.
+
+FIXED VERSION - Skips push for local registries
 """
 
 import os
@@ -11,6 +13,7 @@ import tempfile
 import zipfile
 import json
 import httpx
+import logging
 from typing import Dict, Any, List, IO
 from .base import BasePlatform, PlatformError
 from ..utils.misc import DockerUtils, DockerError
@@ -22,6 +25,11 @@ class KnativePlatform(BasePlatform):
         "python:3.9": "python:3.9-slim",
         "python:3.10": "python:3.10-slim",
         "python:3.11": "python:3.11-slim",
+        "python:3.8": "python:3.8-slim",
+        "python3.9": "python:3.9-slim",
+        "python3.10": "python:3.10-slim",
+        "python3.11": "python:3.11-slim",
+        "python3.8": "python:3.8-slim",
         "node:18": "node:18-alpine",
         "node:20": "node:20-alpine",
         "go:1.21": "golang:1.21-alpine"
@@ -31,316 +39,249 @@ class KnativePlatform(BasePlatform):
         super().__init__(platform_config)
         self.docker_utils = DockerUtils()
 
+    def _is_local_registry(self) -> bool:
+        """Check if we're using a local registry that doesn't need push"""
+        registry = self.config.get("container_registry", "")
+        local_registries = ["", "local", "dev.local", "localhost", "minikube"]
+        return registry.lower() in local_registries or registry.startswith("localhost:")
+
     async def _build_and_push_image(self, image_name: str, handler: str, runtime: str, code_stream: IO[bytes]) -> None:
-        """
-        Builds a container image locally using docker and pushes it to a registry.
-        """
+        if "python" in runtime and ":" not in runtime:
+            runtime = runtime.replace("python", "python:")
         base_image = self.RUNTIME_TO_BASE_IMAGE.get(runtime)
         if not base_image:
-            raise PlatformError(
-                f"unsupported runtime: '{runtime}'. supported runtimes are: {list(self.RUNTIME_TO_BASE_IMAGE.keys())}")
+            raise PlatformError(f"unsupported runtime: '{runtime}'.")
 
         with tempfile.TemporaryDirectory() as temp_dir:
-            # read the code stream into a temporary file first
             with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_zip:
-                # reset stream position to beginning
                 code_stream.seek(0)
-                # copy content to temporary file
                 temp_zip.write(code_stream.read())
                 temp_zip.flush()
-
-                # extract from the temporary file
                 with zipfile.ZipFile(temp_zip.name, 'r') as zip_ref:
                     zip_ref.extractall(temp_dir)
-
-                # clean up
                 os.unlink(temp_zip.name)
 
-            # create the dockerfile dynamically
-            dockerfile_content = f"""
-            FROM {base_image}
-            WORKDIR /app
-            COPY . .
-            RUN if [ -f requirements.txt ]; then pip install --no-cache-dir -r requirements.txt; fi
-            EXPOSE 8080
-            ENV PORT=8080
-            CMD ["uvicorn", "{handler}", "--host", "0.0.0.0", "--port", "8080", "--workers", "1"]
-            """
-            with open(f"{temp_dir}/Dockerfile", "w") as f:
+            # FIXED WSGI wrapper with proper indentation
+            wsgi_wrapper = f'''import sys, os, importlib, json
+from urllib.parse import parse_qs
+sys.path.insert(0, "/app")
+
+def application(environ, start_response):
+    try:
+        if environ.get("REQUEST_METHOD") == "GET" and environ.get("PATH_INFO", "/") == "/":
+            start_response("200 OK", [("Content-Type", "application/json")])
+            return [json.dumps({{"status": "healthy"}}).encode("utf-8")]
+        
+        content_length = int(environ.get("CONTENT_LENGTH", 0))
+        if content_length > 0:
+            request_body = environ["wsgi.input"].read(content_length).decode("utf-8")
+            try:
+                event_data = json.loads(request_body)
+            except json.JSONDecodeError:
+                event_data = {{"body": request_body}}
+        else:
+            event_data = {{}}
+        
+        m, f = "{handler}".split(":")
+        handler_module = importlib.import_module(m)
+        handler_func = getattr(handler_module, f)
+        
+        result = handler_func(None, event_data)
+        
+        status_code = result.get("statusCode", 200)
+        body = result.get("body", "")
+        headers = result.get("headers", {{}})
+        
+        if isinstance(body, dict):
+            body = json.dumps(body)
+        elif not isinstance(body, str):
+            body = str(body)
+        
+        response_headers = [("Content-Type", headers.get("Content-Type", "application/json"))]
+        for key, value in headers.items():
+            if key.lower() != "content-type":
+                response_headers.append((key, str(value)))
+        
+        start_response(f"{{status_code}} OK", response_headers)
+        return [body.encode("utf-8")]
+        
+    except Exception as e:
+        import traceback
+        error_details = {{
+            "error": str(e),
+            "error_type": type(e).__name__,
+            "traceback": traceback.format_exc()
+        }}
+        start_response("500 Internal Server Error", [("Content-Type", "application/json")])
+        return [json.dumps(error_details).encode("utf-8")]
+
+app = application
+'''
+
+            with open(os.path.join(temp_dir, "wsgi_app.py"), "w") as f:
+                f.write(wsgi_wrapper)
+
+            dockerfile_content = f'''FROM {base_image}
+WORKDIR /app
+COPY . .
+RUN if [ -f /etc/apt/sources.list ]; then apt-get update && apt-get install -y curl; fi
+RUN pip install gunicorn
+RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+EXPOSE 8080
+CMD ["gunicorn", "-b", "0.0.0.0:8080", "wsgi_app:app"]'''
+
+            with open(os.path.join(temp_dir, "Dockerfile"), "w") as f:
                 f.write(dockerfile_content)
 
-            # build and push the image, the calls are async so they are ran in thread
-            try:
-                await asyncio.to_thread(self.docker_utils.build_image, temp_dir, image_name)
-                await asyncio.to_thread(self.docker_utils.push_image, image_name)
+            # Always build the image
+            await asyncio.to_thread(self.docker_utils.build_image, temp_dir, image_name)
 
-            except DockerError as e:
-                raise PlatformError(f"failed to build or push image: {e.message}")
+            # Only push if not using local registry
+            if not self._is_local_registry():
+                logging.info(f"Pushing image to registry: {image_name}")
+                await asyncio.to_thread(self.docker_utils.push_image, image_name)
+            else:
+                logging.info(f"Skipping push for local registry: {image_name}")
 
     async def deploy(self, func_name: str, handler: str, runtime: str, code_stream: IO[bytes]) -> Dict[str, Any]:
-        """
-        Deploys a function by building a custom Docker image and using kn CLI
-        """
-        start_time = time.monotonic()
         namespace = self.config.get("namespace", "default")
-        registry = self.config.get("container_registry")
+        registry = self.config.get("container_registry", "local")
 
-        if not registry:
-            raise PlatformError("'container_registry' must be specified in the config for knative.")
+        # Handle empty registry or local registries
+        if self._is_local_registry():
+            # For local registries, use a simple image name that doesn't need pushing
+            image_destination = f"local/{func_name}:latest"
+        else:
+            image_destination = f"{registry}/{func_name}:latest"
 
-        image_destination = f"{registry}/{func_name}:latest"
+        await self._build_and_push_image(image_destination, handler, runtime, code_stream)
+
+        # Deploy with kn CLI
+        cmd = ["kn", "service", "apply", func_name, "--image", image_destination,
+               "--namespace", namespace, "--port", "8080", "--timeout", "300", "--wait"]
 
         try:
-            # build and push the custom docker image
-            await self._build_and_push_image(image_destination, handler, runtime, code_stream)
-
-            # deploy using kn cli
-            cmd = [
-                "kn", "service", "apply", func_name,
-                "--image", image_destination,
-                "--namespace", namespace,
-                "--port", "8080"
-            ]
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-
+            process = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
             stdout, stderr = await process.communicate()
 
             if process.returncode != 0:
-                raise PlatformError(f"'kn service apply' failed with exit code {process.returncode}.\nstdout: {stdout.decode()}\nstderr: {stderr.decode()}")
+                error_msg = stderr.decode() if stderr else "Unknown deployment error"
+                logging.error(f"kn service apply failed: {error_msg}")
+                raise PlatformError(f"'kn service apply' failed: {error_msg}")
+
+            logging.info(f"Successfully deployed {func_name}")
+            return {"status": "success", "name": func_name}
 
         except FileNotFoundError:
-            raise PlatformError("the 'kn' command is not installed")
+            raise PlatformError("the 'kn' command is not installed.")
         except Exception as e:
-            raise PlatformError(f"an unexpected error occurred during deployment: {e}")
-
-        duration = time.monotonic() - start_time
-
-        return {
-            "status": "success",
-            "name": func_name,
-            "image": image_destination,
-            "platform": 'knative',
-            "deployment_duration_seconds": duration,
-        }
+            logging.error(f"Deployment failed: {e}")
+            raise PlatformError(f"Deployment failed: {e}")
 
     async def invoke(self, func_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Invokes a deployed knative service using port-forwarding (more reliable for local development)
-        """
-        start_time = time.monotonic()
         namespace = self.config.get("namespace", "default")
-
         try:
-            # check if service exists
-            cmd = [
-                "kn", "service", "describe", func_id,
-                "--namespace", namespace,
-                "--output", "url"
-            ]
+            # First try to get the service URL
+            cmd = ["kn", "service", "describe", func_id, "--namespace", namespace, "-o", "url"]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await proc.communicate()
 
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-
-            stdout, stderr = await process.communicate()
-
-            if process.returncode:
-                if "not found" in stderr.decode().lower():
-                    raise PlatformError(f"knative service '{func_id}' not found.")
-                else:
-                    raise PlatformError(f"'kn service describe' failed: {stderr.decode()}")
+            if proc.returncode != 0:
+                raise PlatformError(f"Service {func_id} not found: {stderr.decode()}")
 
             service_url = stdout.decode().strip()
+            logging.info(f"Invoking service at URL: {service_url}")
 
-            # use port-forwarding approach for local access
-            get_pod_cmd = [
-                "kubectl", "get", "pods",
-                "-l", f"serving.knative.dev/service={func_id}",
-                "-o", "jsonpath={.items[0].metadata.name}",
-                "-n", namespace
-            ]
+            # Try direct URL invocation first
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(service_url, json=payload)
+                response.raise_for_status()
+                return {"status": "success", "function_response": response.json()}
 
-            # check if pod exists
-            pod_process = await asyncio.create_subprocess_exec(
-                *get_pod_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
+        except (httpx.RequestError, httpx.HTTPStatusError) as e:
+            logging.info(f"Direct URL invocation failed ({e}). Trying kubectl port-forward fallback...")
 
-            pod_stdout, pod_stderr = await pod_process.communicate()
-            pod_name = pod_stdout.decode().strip()
-
-            if not pod_name:
-                # make a request to trigger scaling will fail but start pod
-                try:
-                    async with httpx.AsyncClient(timeout=5.0) as client:
-                        await client.get(service_url)
-                except:
-                    pass
-
-                # wait for pod to start
-                for i in range(15):
-                    await asyncio.sleep(1)
-                    pod_process = await asyncio.create_subprocess_exec(
-                        *get_pod_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-                    pod_stdout, pod_stderr = await pod_process.communicate()
-                    pod_name = pod_stdout.decode().strip()
-                    if pod_name:
-                        print(f"pod started: {pod_name}")
-                        break
-                else:
-                    raise PlatformError(f"pod failed to start for service {func_id}")
-            else:
-                print(f"found existing pod: {pod_name}")
-
-            # start port forward to the pod
-            port_forward_cmd = [
-                "kubectl", "port-forward",
-                pod_name, "8080:8080",
-                "-n", namespace
-            ]
-
-            print(f"Starting port-forward: kubectl port-forward {pod_name} 8080:8080")
-            port_forward_process = await asyncio.create_subprocess_exec(
-                *port_forward_cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-
-            # give port forward time to establish
-            await asyncio.sleep(3)
-
+            # Fallback to port-forward approach
+            pf_proc = None
             try:
-                # invoke via port forward
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    print("Invoking via port-forward at localhost:8080")
-                    response = await client.post(url="http://localhost:8080/", json=payload)
+                pod_name = None
+                # Retry logic to find the pod
+                for attempt in range(5):
+                    pod_cmd = ["kubectl", "get", "pods", "--namespace", namespace,
+                             "-l", f"serving.knative.dev/service={func_id}",
+                             "-o", "jsonpath={.items[0].metadata.name}"]
+                    pod_proc = await asyncio.create_subprocess_exec(*pod_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                    pod_stdout, _ = await pod_proc.communicate()
+                    pod_name = pod_stdout.decode().strip()
+
+                    if pod_name and pod_name != "":
+                        logging.info(f"Found pod '{pod_name}' for service '{func_id}' on attempt {attempt + 1}.")
+                        break
+
+                    logging.warning(f"Attempt {attempt + 1} to find pod for service '{func_id}' failed. Retrying in 2 seconds...")
+                    await asyncio.sleep(2)
+
+                if not pod_name or pod_name == "":
+                    raise PlatformError(f"No pods found for service '{func_id}' in namespace '{namespace}' after multiple attempts.")
+
+                # Start port-forward
+                pf_cmd = ["kubectl", "port-forward", "--namespace", namespace, pod_name, "8080:8080"]
+                pf_proc = await asyncio.create_subprocess_exec(*pf_cmd)
+                await asyncio.sleep(3)  # Wait for port-forward to establish
+
+                # Invoke via port-forward
+                async with httpx.AsyncClient(timeout=60.0) as client:
+                    response = await client.post("http://localhost:8080", json=payload)
                     response.raise_for_status()
+                    return {"status": "success", "function_response": response.json()}
 
-                    try:
-                        function_response_data = response.json()
-                    except:
-                        function_response_data = {"response": response.text}
-
+            except Exception as pf_error:
+                logging.error(f"Port-forward invocation failed: {pf_error}", exc_info=True)
+                raise PlatformError(f"Port-forward invocation failed: {pf_error}")
             finally:
-                # clean up
-                try:
-                    port_forward_process.terminate()
-                    await port_forward_process.wait()
-                except:
-                    pass
+                if pf_proc:
+                    pf_proc.terminate()
+                    try:
+                        await asyncio.wait_for(pf_proc.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        pf_proc.kill()
 
-        except FileNotFoundError:
-            raise PlatformError("the 'kn' command is not installed")
-        except httpx.HTTPStatusError as e:
-            raise PlatformError(f"function '{func_id}' returned an error: {e.response.status_code} - {e.response.text}")
-        except httpx.RequestError as e:
-            raise PlatformError(f"failed to connect to function '{func_id}': {str(e)}")
         except Exception as e:
-            raise PlatformError(f"an unexpected error occurred during invocation: {str(e)} - {type(e).__name__}")
-
-        duration = time.monotonic() - start_time
-        return {
-            "status": "success",
-            "invocation_duration_seconds": duration,
-            "function_response": function_response_data
-        }
+            logging.error(f"Invocation failed: {e}", exc_info=True)
+            raise PlatformError(f"Invocation failed: {e}")
 
     async def list_functions(self) -> List[Dict[str, Any]]:
-        """
-        Lists all deployed knative services using kn CLI
-        """
         namespace = self.config.get("namespace", "default")
-
         try:
-            cmd = [
-                "kn", "service", "list",
-                "--namespace", namespace,
-                "--output", "json"
-            ]
+            cmd = ["kn", "service", "list", "--namespace", namespace, "-o", "json"]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await proc.communicate()
 
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-
-            stdout, stderr = await process.communicate()
-
-            if process.returncode != 0:
-                raise PlatformError(f"'kn service list' failed: {stderr.decode()}")
-
-            # parse json
-            output = stdout.decode().strip()
-            if not output:
+            if proc.returncode != 0:
+                logging.error(f"Failed to list services: {stderr.decode()}")
                 return []
 
-            services_data = json.loads(output)
+            result = json.loads(stdout.decode())
+            return result.get("items", [])
 
-            functions_list = []
-            for item in services_data.get("items", []):
-                metadata = item.get("metadata", {})
-                status = item.get("status", {})
-
-                # check if service is ready
-                conditions = status.get("conditions", [])
-                ready = any(c.get('status') == 'True' and c.get('type') == 'Ready' for c in conditions)
-
-                functions_list.append({
-                    "name": metadata.get("name"),
-                    "url": status.get("url"),
-                    "ready": ready,
-                })
-
-            return functions_list
-
-        except FileNotFoundError:
-            raise PlatformError("the 'kn' command is not installed")
-        except json.JSONDecodeError as e:
-            raise PlatformError(f"Failed to parse kn service list output: {e}")
         except Exception as e:
-            raise PlatformError(f"An unexpected error occurred while listing functions: {e}")
+            logging.error(f"Error listing functions: {e}")
+            return []
 
     async def delete_function(self, func_id: str) -> Dict[str, Any]:
-        """
-        Deletes a specific knative service
-        """
         namespace = self.config.get("namespace", "default")
-
         try:
-            cmd = [
-                "kn", "service", "delete", func_id,
-                "--namespace", namespace,
-                "--wait"
-            ]
+            cmd = ["kn", "service", "delete", func_id, "--namespace", namespace, "--wait"]
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await proc.communicate()
 
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
+            if proc.returncode != 0:
+                error_msg = stderr.decode() if stderr else "Unknown deletion error"
+                logging.warning(f"Delete command failed: {error_msg}")
+                # Don't raise error for delete - service might not exist
 
-            stdout, stderr = await process.communicate()
+            return {"message": f"Deletion request for '{func_id}' sent."}
 
-            if process.returncode != 0:
-                stderr_text = stderr.decode()
-                if "not found" in stderr_text.lower():
-                    return {"message": f"knative service '{func_id}' not found, assumed already deleted."}
-                else:
-                    raise PlatformError(f"'kn service delete' failed: {stderr_text}")
-
-            return {"message": f"knative service '{func_id}' deletion completed successfully."}
-
-        except FileNotFoundError:
-            raise PlatformError("the 'kn' command is not installed")
         except Exception as e:
-            raise PlatformError(f"an unexpected error occurred while deleting function: {e}")
+            logging.error(f"Error deleting function: {e}")
+            return {"message": f"Deletion failed for '{func_id}': {e}"}

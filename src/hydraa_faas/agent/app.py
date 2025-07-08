@@ -1,144 +1,184 @@
-"""
-Main fastapi application for faas middleware.
+"""FastAPI app for FaaS function management."""
 
-TODO: implement async into platforms
-TODO: add/fix docstrings
-TODO: add typing and exception handling
-"""
-
+import os
+import logging
 import yaml
-from typing import Optional, Dict, Any
-from .platforms.knative import KnativePlatform
+from pathlib import Path
+from typing import Dict, Any, Optional
+from io import BytesIO
+
+from fastapi import FastAPI, HTTPException, File, UploadFile, Form
+from fastapi.responses import JSONResponse
+
 from .platforms.nuclio import NuclioPlatform
-from .platforms.base import PlatformError
-from .utils import misc
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
-import uvicorn
-from .utils.models import InvocationRequest, DeleteRequest
-app = FastAPI() # start app
+from .platforms.knative import KnativePlatform
+from .utils.models import (
+    InvocationRequest, DeleteRequest, DeploymentResponse,
+    InvocationResponse, ListResponse, DeleteResponse,
+    ErrorResponse, HealthResponse
+)
 
-PLATFORM_TO_CLASS = {
-    'knative': KnativePlatform,
-    'nuclio': NuclioPlatform,
-}
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# read from config.yaml and configure platform adapter
-with open('agent/config/config.yaml', 'r') as f:
-    config = yaml.safe_load(f)
+app = FastAPI(title="FaaS Agent", version="1.0.0")
 
-platform = config.get('platform')
-platform_manager = PLATFORM_TO_CLASS[platform](config.get('platforms').get(platform))
+# Global configuration
+CONFIG_FILE = Path("agent/config/config.yaml")
+config = {}
+platform_adapter = None
 
-@app.get("/health")
-async def health() -> Dict[str, Any]:
-    """
-    Health check endpoint.
+def load_config():
+    """Load configuration from config.yaml"""
+    global config, platform_adapter
 
-    Returns:
-        JSON response with service status.
-    """
-    return {"status": "healthy",
-            "platform":platform}
-@app.post("/deploy")
-async def deploy_func(function_name: Optional[str] = Form(None),
-                      handler: str = Form("main:handler"),
-                      runtime: Optional[str] = Form('python3.9'),
-                      code_file: UploadFile = File(...)) -> Dict[str, Any]:
+    if not CONFIG_FILE.exists():
+        raise Exception(f"Configuration file {CONFIG_FILE} not found")
 
-    """
-    Receives deployment request and routes
-    it to the appropriate platform manager.
+    with open(CONFIG_FILE, 'r') as f:
+        config = yaml.safe_load(f)
 
-    Returns:
-        JSON response with the function's result or an error.
+    # Initialize platform adapter
+    platform_name = config.get('platform', 'nuclio')
+    platform_config = config.get('platforms', {}).get(platform_name, {})
 
-    Raises:
-        HTTPException when deployment fails.
-    """
+    if platform_name == 'nuclio':
+        platform_adapter = NuclioPlatform(platform_config)
+    elif platform_name == 'knative':
+        platform_adapter = KnativePlatform(platform_config)
+    else:
+        raise Exception(f"Unsupported platform: {platform_name}")
+
+    logger.info(f"Initialized {platform_name} platform adapter")
+
+# Load configuration on startup
+try:
+    load_config()
+except Exception as e:
+    logger.error(f"Failed to load configuration: {e}")
+    raise
+
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """Health check endpoint"""
+    return HealthResponse(
+        status="healthy",
+        platform=config.get('platform', 'unknown'),
+        version="1.0.0",
+        config_path=str(CONFIG_FILE)
+    )
+
+@app.post("/deploy", response_model=DeploymentResponse)
+async def deploy_function(
+    handler: str = Form(..., description="Handler function (e.g., 'handler:main')"),
+    runtime: str = Form(default="python:3.9", description="Runtime environment"),
+    name: Optional[str] = Form(default=None, description="Function name (auto-generated if not provided)"),
+    code: UploadFile = File(..., description="Zip file containing function code")
+):
+    """Deploy function from uploaded zip file"""
     try:
-        result = await platform_manager.deploy(
-            func_name=function_name or misc.generate_id(),
-            runtime=runtime,
-            handler=handler,
-            code_stream=code_file.file)
-        return result
-    except PlatformError as e:
-        raise HTTPException(status_code=500, detail=f"{platform} deployment failed: {e}")
+        # Generate function name if not provided
+        if not name:
+            import uuid
+            name = f"func-{uuid.uuid4().hex[:8]}"
 
-@app.post("/invoke")
-async def invoke_function(request_data: InvocationRequest) -> Dict[str, Any]:
-    """
-    Receives invocation request and routes it to
-    the appropriate platform manager.
+        # Validate uploaded file
+        if not code.filename.endswith('.zip'):
+            raise HTTPException(status_code=400, detail="File must be a zip archive")
 
-    Returns:
-        JSON response with the function's result or an error.
+        # Read uploaded file
+        code_content = await code.read()
+        code_stream = BytesIO(code_content)
 
-    Raises:
-        HTTPException when invocation fails.
-    """
-    try:
-        func_id = request_data.id
-        payload = request_data.payload
-        return await platform_manager.invoke(func_id, payload)
+        # Deploy function
+        result = await platform_adapter.deploy(name, handler, runtime, code_stream)
 
-    except PlatformError as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"{platform} invocation failed: {e}"
+        return DeploymentResponse(
+            status="success",
+            name=name,
+            platform=config.get('platform'),
+            details=result
         )
-@app.post("/list")
-async def list_functions() -> Dict[str, Any]:
-    """
-    Lists deployed functions for a platform.
 
-    Returns:
-        JSON response with list of functions.
-
-    Raises:
-        HTTPException when listing fails.
-    """
-    try:
-        functions_list = await platform_manager.list_functions()
-        return {
-            "status": "success",
-            "platform": platform,
-            "data": {"functions": functions_list}
-        }
-    except PlatformError as e:
-        raise HTTPException(status_code=500, detail=f"failed to list functions for {platform}: {e}")
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"an unexpected error occurred: {str(e)}")
+        logger.error(f"Deployment failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/delete")
-async def delete_function(request_data: DeleteRequest) -> Dict[str, Any]:
-    """
-    Deletes a deployed function by its ID.
-
-    Args:
-        request_data: A JSON body with a required 'id' field.
-
-    Returns:
-        JSON response with the deletion result or an error.
-
-    Raises:
-        HTTPException when deletion fails.
-    """
+@app.post("/invoke", response_model=InvocationResponse)
+async def invoke_function(request: InvocationRequest):
+    """Invoke deployed function"""
     try:
-        func_id = request_data.id
-        result = await platform_manager.delete_function(func_id)
-        return {
-            "status": "success",
-            "platform": platform,
-            "data": result
-        }
-    except PlatformError as e:
-        raise HTTPException(status_code=404,
-                            detail=f"function not found or could not be deleted on {platform}: {e}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"function deletion failed: {e}")
+        result = await platform_adapter.invoke(request.id, request.payload or {})
 
-if __name__ == '__main__':
-    print(f"starting agent\n\
-            platform: {platform}\n")
-    uvicorn.run(app, host="0.0.0.0", port=config.get("Port"))
+        return InvocationResponse(
+            status="success",
+            function_id=request.id,
+            platform=config.get('platform'),
+            function_response=result.get('function_response'),
+            invocation_time=result.get('invocation_time'),
+            details=result
+        )
+
+    except Exception as e:
+        logger.error(f"Invocation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/functions", response_model=ListResponse)
+async def list_functions():
+    """List deployed functions"""
+    try:
+        functions = await platform_adapter.list_functions()
+
+        return ListResponse(
+            status="success",
+            platform=config.get('platform'),
+            count=len(functions),
+            data={"functions": functions}
+        )
+
+    except Exception as e:
+        logger.error(f"Function listing failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/delete", response_model=DeleteResponse)
+async def delete_function(request: DeleteRequest):
+    """Delete deployed function"""
+    try:
+        result = await platform_adapter.delete_function(request.id)
+
+        return DeleteResponse(
+            status="success",
+            platform=config.get('platform'),
+            function_id=request.id,
+            message=result.get('message', f"Function {request.id} deleted"),
+            data=result
+        )
+
+    except Exception as e:
+        logger.error(f"Function deletion failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request, exc):
+    """Global exception handler"""
+    logger.error(f"Unhandled exception: {exc}")
+
+    return JSONResponse(
+        status_code=500,
+        content=ErrorResponse(
+            status="error",
+            error=str(exc),
+            platform=config.get('platform')
+        ).dict()
+    )
+
+if __name__ == "__main__":
+    import uvicorn
+
+    print("FaaS Agent starting...")
+    print(f"Platform: {config.get('platform')}")
+    print(f"Kubernetes Target: {config.get('kubernetes_target', {}).get('type')}")
+
+    port = config.get('Port', 8000)
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

@@ -8,7 +8,7 @@ kubernetes_target:
   type: "minikube"
   # ~/.kube/config or in cluster authentication if deployed inside kubernetes
   # if this is commented out the agent will try standard locations
-  kubeconfig_path: "/home/ec2-user/.kube/config"
+  kubeconfig_path: "/home/ec2-user/.kube/config" # change to /Users/monoble/.kube/config
   # the name of the context to use from your kubeconfig file
   # if this is commented out the agent will use the current default context
   context_name: "minikube"
@@ -35,6 +35,8 @@ platforms:
         env:
           - name: "LOG_LEVEL"
             value: "INFO"
+          - name: NUCLIO_PYTHON_PIP_INSTALL_EXTRA_ARGS
+            value: "--index-url https://pypi.org/simple"
         triggers:
           default_http:
             kind: "http"

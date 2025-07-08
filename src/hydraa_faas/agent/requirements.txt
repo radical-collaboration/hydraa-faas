@@ -4,3 +4,4 @@ pydantic
 PyYaml
 httpx
 kubernetes
+python-multipart

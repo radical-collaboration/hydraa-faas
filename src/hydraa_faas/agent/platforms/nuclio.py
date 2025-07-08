@@ -1,347 +1,379 @@
-"""
-Nuclio platform manager
-"""
+"""Nuclio platform adapter"""
 
-import json
 import os
+import json
 import time
 import asyncio
+import subprocess
 import tempfile
-import yaml
-import httpx
 import zipfile
+import httpx
+import yaml
+import logging
 from typing import Dict, Any, List, IO
+from pathlib import Path
+
 from .base import BasePlatform, PlatformError
+from ..utils.misc import DockerUtils, DockerError
+
+logger = logging.getLogger(__name__)
 
 
 class NuclioPlatform(BasePlatform):
-    """Nuclio platform manager"""
+    """Nuclio platform adapter implementation"""
 
     def __init__(self, platform_config: Dict[str, Any]):
-        """Initialize Nuclio Platform
-
-        Args:
-            platform_config: Nuclio configuration
-        """
         super().__init__(platform_config)
+        self.namespace = platform_config.get('namespace', 'nuclio')
+        self.platform = 'kube'
+        self.timeout = int(os.getenv('NUCLIO_TIMEOUT', '60'))
+        self.docker_utils = DockerUtils()
+
+        # Check if we're in local workflow
+        self.container_registry = platform_config.get('container_registry', 'local')
+        self.is_local = self.container_registry in ['local', '', 'localhost']
+
+    async def _run_command(self, args: List[str]) -> subprocess.CompletedProcess:
+        """Run nuctl CLI command"""
+        cmd = ['nuctl'] + args + ['--platform', self.platform, '--namespace', self.namespace]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=self.timeout)
+
+            return type('MockResult', (), {
+                'returncode': proc.returncode,
+                'stdout': stdout.decode(),
+                'stderr': stderr.decode()
+            })()
+        except asyncio.TimeoutError:
+            raise PlatformError(f"Command timed out: {' '.join(cmd)}")
+        except Exception as e:
+            raise PlatformError(f"Command failed: {e}")
+
+    def _create_function_config(self, func_id: str, image: str, handler: str = "handler:handler") -> Dict[str, Any]:
+        """Create nuclio function configuration"""
+        return {
+            'apiVersion': 'nuclio.io/v1beta1',
+            'kind': 'NuclioFunction',
+            'metadata': {
+                'name': func_id,
+                'namespace': self.namespace,
+                'labels': {'faas-middleware': 'true'}
+            },
+            'spec': {
+                'runtime': 'python:3.9',
+                'handler': handler,
+                'image': image,
+                'imagePullPolicy': 'Never' if self.is_local else 'IfNotPresent',
+                'triggers': {
+                    'default-http': {
+                        'kind': 'http',
+                        'maxWorkers': 1,
+                        'attributes': {
+                            'serviceType': 'ClusterIP',
+                            'port': 8080
+                        }
+                    }
+                },
+                'resources': {
+                    'requests': {
+                        'cpu': '100m',
+                        'memory': '128Mi'
+                    },
+                    'limits': {
+                        'cpu': '1000m',
+                        'memory': '512Mi'
+                    }
+                }
+            }
+        }
+
+    async def _build_image(self, func_name: str, code_stream: IO[bytes], handler: str) -> str:
+        """Build Docker image from zip file"""
+        if self.is_local:
+            image_name = f"nuclio-{func_name}:latest"
+        else:
+            image_name = f"{self.container_registry}/nuclio-{func_name}:latest"
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Extract zip file
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_zip:
+                code_stream.seek(0)
+                temp_zip.write(code_stream.read())
+                temp_zip.flush()
+
+                with zipfile.ZipFile(temp_zip.name, 'r') as zip_ref:
+                    zip_ref.extractall(temp_dir)
+                os.unlink(temp_zip.name)
+
+            # Create Nuclio-compatible handler wrapper
+            handler_wrapper = f'''
+import sys
+import os
+sys.path.insert(0, '/opt/nuclio')
+
+# Import the original handler
+{handler.split(':')[0] if ':' in handler else 'handler'}
+
+def handler(context, event):
+    """Nuclio handler wrapper"""
+    try:
+        # Get the actual handler function
+        handler_module = "{handler.split(':')[0] if ':' in handler else 'handler'}"
+        handler_func = "{handler.split(':')[1] if ':' in handler else 'handler'}"
+        
+        import importlib
+        module = importlib.import_module(handler_module)
+        func = getattr(module, handler_func)
+        
+        # Call the function
+        result = func(context, event)
+        return result
+    except Exception as e:
+        context.logger.error(f"Handler error: {{e}}")
+        raise e
+'''
+
+            # Write the wrapper
+            with open(os.path.join(temp_dir, 'nuclio_handler.py'), 'w') as f:
+                f.write(handler_wrapper)
+
+            # Create Dockerfile
+            dockerfile_content = '''FROM python:3.9-slim
+
+WORKDIR /opt/nuclio
+
+# Copy all files
+COPY . .
+
+# Install dependencies if requirements.txt exists
+RUN if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+# Install nuclio SDK
+RUN pip install nuclio-sdk
+
+# Set handler
+ENV NUCLIO_HANDLER=nuclio_handler:handler
+
+CMD ["python", "-m", "nuclio"]
+'''
+
+            with open(os.path.join(temp_dir, 'Dockerfile'), 'w') as f:
+                f.write(dockerfile_content)
+
+            # Build image
+            logger.info(f"Building image: {image_name}")
+            await asyncio.to_thread(self.docker_utils.build_image, temp_dir, image_name)
+
+            # Push image if not local
+            if not self.is_local:
+                logger.info(f"Pushing image: {image_name}")
+                await asyncio.to_thread(self.docker_utils.push_image, image_name)
+
+            return image_name
 
     async def deploy(self, func_name: str, handler: str, runtime: str, code_stream: IO[bytes]) -> Dict[str, Any]:
-        """
-        Deploys a function
-
-        Args:
-            func_name: Name for deployed function
-            handler: Function handler (e.g. main:handler)
-            runtime: Language runtime
-            code_stream: File object representing the zipped source code
-
-        Returns:
-            Dict with deployed status
-
-        Raises:
-            PlatformError if deployment fails
-        """
-        start_time = time.monotonic()
-        namespace = self.config.get("namespace", "nuclio")
+        """Deploy function to nuclio"""
+        start_time = time.time()
 
         try:
-            with tempfile.TemporaryDirectory() as temp_dir:
-                # read the code stream into a temporary file first
-                with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as temp_zip:
-                    # reset stream position to beginning
-                    code_stream.seek(0)
-                    # copy content to temporary file
-                    temp_zip.write(code_stream.read())
-                    temp_zip.flush()
+            # Build image
+            image_name = await self._build_image(func_name, code_stream, handler)
 
-                    # extract from the temporary file
-                    with zipfile.ZipFile(temp_zip.name, 'r') as zf:
-                        zf.extractall(temp_dir)
+            # Create function config
+            config = self._create_function_config(func_name, image_name, handler)
 
-                    # clean up
-                    os.unlink(temp_zip.name)
+            # Deploy using kubectl (more reliable than nuctl for complex configs)
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.yaml', delete=False) as f:
+                yaml.dump(config, f, default_flow_style=False)
+                config_file = f.name
 
-                # create function manifest yaml file
-                function_manifest = self.config.get("function_defaults", {}).copy()
-                spec = function_manifest.setdefault('spec', {})
-
-                # add build configuration with your registry
-                build = spec.setdefault('build', {})
-                build['registry'] = self.config.get("container_registry", "docker.io/your-username")
-                build['noBaseImagesPull'] = False
-
-                spec['runtime'] = runtime
-                spec['handler'] = handler
-
-                with open(f"{temp_dir}/function.yaml", 'w') as f:
-                    yaml.dump(function_manifest, f)
-
-                # try to delete any existing function
-                print(f"Cleaning up any existing function: {func_name}")
-                delete_cmd = [
-                    "nuctl", "delete", "function", func_name,
-                    "--namespace", namespace
-                ]
-
-                delete_process = await asyncio.create_subprocess_exec(
-                    *delete_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-
-                await delete_process.communicate()
-
-                # wait longer for cleanup. make 10
-                await asyncio.sleep(5)
-
-                # verify function is gone before proceeding
-                check_cmd = [
-                    "nuctl", "get", "function", func_name,
-                    "--namespace", namespace
-                ]
-
-                for attempt in range(6):  # try for up to 30 seconds
-                    check_process = await asyncio.create_subprocess_exec(
-                        *check_cmd,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.PIPE
-                    )
-
-                    await check_process.communicate()
-
-                    if check_process.returncode:
-                        print(f"function {func_name} successfully deleted")
-                        break
-                    else:
-                        print(f"function {func_name} still exists, waiting (attempt {attempt + 1}/6)")
-                        await asyncio.sleep(5)
-                else:
-                    print(f"warning: function {func_name} may still exist, proceeding anyway")
-
-                # deploy the function with registry specification
-                registry = self.config.get("container_registry")
-                cmd = [
-                    "nuctl", "deploy", func_name,
-                    "--namespace", namespace,
-                    "--path", temp_dir
-                ]
-
-                # add registry if configured
-                if registry:
-                    cmd.extend(["--registry", registry])
-
-                process = await asyncio.create_subprocess_exec(
+            try:
+                # Apply the configuration
+                cmd = ['kubectl', 'apply', '-f', config_file]
+                proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
+                stdout, stderr = await proc.communicate()
 
-                stdout, stderr = await process.communicate()
+                if proc.returncode != 0:
+                    raise PlatformError(f"Deployment failed: {stderr.decode()}")
 
-                if process.returncode:
-                    raise PlatformError(f"'nuctl deploy' failed with exit code {process.returncode}.\nstdout: {stdout.decode()}\nstderr: {stderr.decode()}")
+                # Wait for function to be ready
+                await self._wait_for_function_ready(func_name)
 
-        except FileNotFoundError:
-            raise PlatformError("the 'nuctl' command is not installed")
+                deployment_time = time.time() - start_time
+
+                return {
+                    'status': 'success',
+                    'name': func_name,
+                    'platform': 'nuclio',
+                    'deployment_time': deployment_time,
+                    'details': {
+                        'image': image_name,
+                        'namespace': self.namespace
+                    }
+                }
+
+            finally:
+                os.unlink(config_file)
+
         except Exception as e:
-            raise PlatformError(f"an unexpected error occurred during deployment: {e}")
+            logger.error(f"Deployment failed: {e}")
+            raise PlatformError(f"Deployment failed: {e}")
 
-        duration = time.monotonic() - start_time
+    async def _wait_for_function_ready(self, func_name: str, max_wait: int = 120):
+        """Wait for function to be ready"""
+        start_time = time.time()
 
-        return {
-            "status": "success",
-            "name": func_name,
-            "platform": "nuclio",
-            "deployment_duration_seconds": duration
-        }
+        while time.time() - start_time < max_wait:
+            try:
+                result = await self._run_command(['get', 'function', func_name, '--output', 'json'])
+
+                if result.returncode == 0:
+                    function_data = json.loads(result.stdout)
+                    state = function_data.get('status', {}).get('state', '')
+
+                    if state == 'ready':
+                        logger.info(f"Function {func_name} is ready")
+                        return
+                    elif state in ['error', 'unhealthy']:
+                        raise PlatformError(f"Function {func_name} failed to deploy: {state}")
+
+            except Exception as e:
+                logger.warning(f"Error checking function status: {e}")
+
+            await asyncio.sleep(5)
+
+        raise PlatformError(f"Function {func_name} did not become ready within {max_wait} seconds")
 
     async def invoke(self, func_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Invokes a deployed function
-
-        Args:
-            func_id: The name of the function to invoke
-            payload: The JSON payload to send in the request body
-
-        Returns:
-            The JSON response from the invoked function
-
-        Raises:
-            PlatformError if invocation fails
-        """
-        start_time = time.monotonic()
-        namespace = self.config.get("namespace", "nuclio")
+        """Invoke function on Nuclio with port forwarding"""
+        start_time = time.time()
 
         try:
-            # use internal cluster service URL
-            internal_url = f"http://{func_id}.{namespace}.svc.cluster.local:8080"
+            # Get function service name
+            service_name = f"nuclio-{func_id}"
 
-            # make http request to the internal service
-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-                print(f"Invoking Nuclio function at internal URL: {internal_url}")
-                response = await client.post(url=internal_url, json=payload)
-                response.raise_for_status()
+            # Use a unique port to avoid conflicts
+            import random
+            local_port = random.randint(8081, 8999)
 
-                # try to parse as JSON
-                try:
-                    function_response_data = response.json()
-                except:
-                    function_response_data = {"response": response.text}
+            # Start port forwarding
+            pf_cmd = ['kubectl', 'port-forward', '-n', self.namespace,
+                     f'svc/{service_name}', f'{local_port}:8080']
 
-        except httpx.HTTPStatusError as e:
-            raise PlatformError(f"function '{func_id}' returned an error: {e.response.status_code} - {e.response.text}")
-        except httpx.RequestError as e:
-            # if internal url fails use forwarding
-            print(f"Internal URL failed ({e}), trying port-forward fallback...")
-
-            try:
-                # get the service name (usually nuclio-FUNCTION_NAME)
-                service_name = f"nuclio-{func_id}"
-
-                # start port forward
-                port_forward_cmd = [
-                    "kubectl", "port-forward",
-                    f"svc/{service_name}", "8080:8080",
-                    "-n", namespace
-                ]
-
-                print(f"Starting port-forward: {' '.join(port_forward_cmd)}")
-                port_forward_process = await asyncio.create_subprocess_exec(
-                    *port_forward_cmd,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE
-                )
-
-                # give port forward time to establish
-                await asyncio.sleep(3)
-
-                try:
-                    # try to invoke
-                    async with httpx.AsyncClient(timeout=30.0) as client:
-                        print("Invoking via port-forward at localhost:8080")
-                        response = await client.post(url="http://localhost:8080/", json=payload)
-                        response.raise_for_status()
-
-                        try:
-                            function_response_data = response.json()
-                        except:
-                            function_response_data = {"response": response.text}
-                finally:
-                    # clean up
-                    try:
-                        port_forward_process.terminate()
-                        await port_forward_process.wait()
-                    except:
-                        pass
-
-            except Exception as pf_error:
-                raise PlatformError(f"Both internal URL and port-forward failed. Internal: {e}, Port-forward: {pf_error}")
-        except Exception as e:
-            raise PlatformError(f"an unexpected error occurred during invocation: {str(e)}")
-
-        duration = time.monotonic() - start_time
-        return {
-            "status": "success",
-            "invocation_duration_seconds": duration,
-            "function_response": function_response_data,
-            "platform": "nuclio"
-        }
-
-    async def list_functions(self) -> List[Dict[str, Any]]:
-        """
-        Lists all deployed functions
-
-        Returns:
-            List of deployed functions
-        """
-        namespace = self.config.get("namespace", "nuclio")
-
-        try:
-            cmd = [
-                "nuctl", "get", "functions",
-                "--namespace", namespace,
-                "--output", "json"
-            ]
-
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
+            pf_proc = await asyncio.create_subprocess_exec(
+                *pf_cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
 
-            stdout, stderr = await process.communicate()
+            # Wait for port forwarding to establish
+            await asyncio.sleep(3)
 
-            if process.returncode:
-                raise PlatformError(f"'nuctl get functions' failed: {stderr.decode()}")
+            try:
+                # Make the request
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    response = await client.post(
+                        f"http://localhost:{local_port}",
+                        json=payload,
+                        headers={'Content-Type': 'application/json'}
+                    )
 
-            # parse json
-            output = stdout.decode().strip()
-            if not output:
+                    if response.status_code == 200:
+                        try:
+                            result = response.json()
+                        except:
+                            result = response.text
+
+                        invocation_time = time.time() - start_time
+
+                        return {
+                            'status': 'success',
+                            'function_id': func_id,
+                            'platform': 'nuclio',
+                            'function_response': result,
+                            'invocation_time': invocation_time
+                        }
+                    else:
+                        raise PlatformError(f"HTTP {response.status_code}: {response.text}")
+
+            finally:
+                # Clean up port forwarding
+                pf_proc.terminate()
+                try:
+                    await asyncio.wait_for(pf_proc.wait(), timeout=5)
+                except asyncio.TimeoutError:
+                    pf_proc.kill()
+
+        except Exception as e:
+            logger.error(f"Invocation failed: {e}")
+            raise PlatformError(f"Invocation failed: {e}")
+
+    async def list_functions(self) -> List[Dict[str, Any]]:
+        """List all deployed Nuclio functions"""
+        try:
+            result = await self._run_command(['get', 'functions', '--output', 'json'])
+
+            if result.returncode != 0:
+                logger.warning(f"Failed to list functions: {result.stderr}")
                 return []
 
-            functions_data = json.loads(output)
+            try:
+                functions_data = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                return []
 
-            functions_list = []
-            # handle both single function and list of functions
+            # Handle both single function and list of functions
             if isinstance(functions_data, dict):
                 functions_data = [functions_data]
 
+            functions = []
             for func in functions_data:
-                metadata = func.get("metadata", {})
-                status = func.get("status", {})
+                metadata = func.get('metadata', {})
+                labels = metadata.get('labels', {})
 
-                functions_list.append({
-                    "name": metadata.get("name"),
-                    "status": status.get("state", "unknown"),
-                    "runtime": func.get("spec", {}).get("runtime"),
-                    "ready": status.get("state") == "ready"
-                })
+                # Only return functions managed by our middleware
+                if labels.get('faas-middleware') == 'true':
+                    functions.append({
+                        'id': metadata.get('name'),
+                        'state': func.get('status', {}).get('state', 'unknown'),
+                        'platform': 'nuclio',
+                        'namespace': metadata.get('namespace', self.namespace)
+                    })
 
-            return functions_list
+            return functions
 
-        except FileNotFoundError:
-            raise PlatformError("the 'nuctl' command is not installed")
-        except json.JSONDecodeError as e:
-            raise PlatformError(f"Failed to parse nuctl output: {e}")
         except Exception as e:
-            raise PlatformError(f"An unexpected error occurred while listing functions: {e}")
+            logger.error(f"Error listing functions: {e}")
+            return []
 
     async def delete_function(self, func_id: str) -> Dict[str, Any]:
-        """
-        Deletes a specific function
-
-        Args:
-            func_id: Function ID to delete
-
-        Returns:
-            Dict with deletion status
-        """
-        namespace = self.config.get("namespace", "nuclio")
-
+        """Delete a deployed Nuclio function"""
         try:
-            cmd = [
-                "nuctl", "delete", "function", func_id,
-                "--namespace", namespace
-            ]
+            result = await self._run_command(['delete', 'function', func_id])
 
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-
-            stdout, stderr = await process.communicate()
-
-            if process.returncode:
-                stderr_text = stderr.decode()
-                if "not found" in stderr_text.lower():
-                    return {"message": f"function '{func_id}' was not found, assumed already deleted."}
+            if result.returncode != 0:
+                # Don't raise error if function doesn't exist
+                if "not found" in result.stderr.lower():
+                    logger.warning(f"Function {func_id} not found")
                 else:
-                    raise PlatformError(f"'nuctl delete' failed: {stderr_text}")
+                    logger.error(f"Failed to delete function: {result.stderr}")
 
-            return {"message": f"function '{func_id}' deleted successfully."}
+            return {
+                'status': 'success',
+                'platform': 'nuclio',
+                'function_id': func_id,
+                'message': f"Function {func_id} deleted successfully"
+            }
 
-        except FileNotFoundError:
-            raise PlatformError("the 'nuctl' command is not installed")
         except Exception as e:
-            raise PlatformError(f"an unexpected error occurred while deleting function: {e}")
+            logger.error(f"Error deleting function: {e}")
+            raise PlatformError(f"Failed to delete function: {e}")

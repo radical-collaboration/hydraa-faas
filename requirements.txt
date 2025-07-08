@@ -1,4 +1,3 @@
 hydraa @ git+https://github.com/radical-project/radical.dream.git
 boto3
 httpx
--e .
