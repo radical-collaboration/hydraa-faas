@@ -25,3 +25,8 @@ class ECRException(FaasException):
 class CostTrackingException(FaasException):
     """Exception raised during cost tracking operations"""
     pass
+
+# Add this new class
+class NuclioException(DeploymentException): # Or inherit directly from FaasException if preferred
+    """Exception raised during Nuclio-specific operations/deployments"""
+    pass
