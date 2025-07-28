@@ -1,5 +1,5 @@
 """
-Simplified FaaS Agent - Production Ready with Nuclio Support Only
+AGnet with Nuclio Support Only
 Acts as a bridge between FaaS Manager and Nuclio on Kubernetes
 """
 
@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="FaaS Agent",
     version="3.0.0",
-    description="Production-ready Nuclio FaaS agent with dynamic configuration support",
+    description="Production ready Nuclio FaaS agent with dynamic configuration support",
     lifespan=lifespan
 )
 
