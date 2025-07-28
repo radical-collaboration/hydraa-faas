@@ -1,7 +1,0 @@
-fastapi
-uvicorn
-pydantic
-PyYaml
-httpx
-kubernetes
-python-multipart

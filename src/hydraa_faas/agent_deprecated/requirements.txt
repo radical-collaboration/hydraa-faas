@@ -1,0 +1,9 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.20.0
+httpx>=0.25.0
+python-multipart
+pydantic>=2.0.0
+PyYAML
+kubernetes
+psutil
+gunicorn
