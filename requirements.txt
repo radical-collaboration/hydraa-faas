@@ -1,3 +1,11 @@
 hydraa @ git+https://github.com/radical-project/radical.dream.git
 boto3
 httpx
+botocore
+pyyaml
+
+#dependencies hydraa failed to install
+radical.utils
+python-blazarclient
+lexicon
+radical.pilot
