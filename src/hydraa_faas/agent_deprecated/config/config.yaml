@@ -1,62 +1,59 @@
-# FaaS Agent Configuration - Minimal Static Settings
-# Version: 3.0 - Dynamic Configuration Support
-
-# Server configuration
+# server configuration
 port: 8000
 
-# Kubernetes cluster configuration
+# kubernetes cluster configuration
 kubernetes_target:
   type: "gke"  # or "minikube"
   kubeconfig_path: ~/.kube/config
   context_name: "gke_nuclio-466606_us-central1-a_nuclio-simple"
 
-  # Ingress configuration (for GKE)
+  # ingress configuration (for GKE)
   ingress:
     namespace: "ingress-nginx"
     service_name: "nginx-ingress-ingress-nginx-controller"
 
-# Nuclio platform configuration
+# nuclio platform configuration
 nuclio:
-  # Default container registry (can be overridden per deployment)
+  # default container registry (can be overridden per deployment)
   container_registry: "docker.io/husseinmohab"
 
-  # Target namespace for deployments
+  # target namespace for deployments
   namespace: "nuclio"
 
-  # Clean up existing function before deploying
+  # clean up existing function before deploying
   cleanup_before_deploy: true
 
-  # Platform-wide defaults (minimal)
+  # platform wide defaults (minimal)
   function_defaults:
     metadata:
       labels:
         nuclio.io/project-name: "default"
 
-# Agent-specific configuration
+# agent specific configuration
 agent:
-  # Cache settings
+  # cache settings
   cache:
     max_size: 1000
     ttl_hours: 24
 
-  # Build settings
+  # build settings
   build:
     timeout_seconds: 600
     max_image_size_mb: 2048
 
-  # Deployment settings
+  # deployment settings
   deployment:
     max_concurrent: 5
     timeout_seconds: 300
     retry_attempts: 3
 
-  # Invocation settings
+  # invocation settings
   invocation:
     timeout_seconds: 60
     retry_attempts: 3
     retry_delay_seconds: 1
 
-# Cross-platform support
+# cross platform support
 cross_platform:
   auto_detect_architecture: true
   base_images:

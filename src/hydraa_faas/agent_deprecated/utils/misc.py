@@ -1,5 +1,5 @@
 """
-Cross-platform utilities for FaaS agent
+utilities for FaaS agent
 Handles Docker operations and system detection
 """
 
@@ -111,23 +111,23 @@ class DockerUtils:
             if 'docker' not in result.stdout:
                 logger.warning("User not in docker group - some operations may require sudo")
         except Exception:
-            pass  # Non-critical check
+            pass  # Non critical check
 
     def _run_command(self, args: List[str], cwd: Optional[str] = None) -> subprocess.CompletedProcess:
         """Run docker command with cross-platform support."""
         cmd = [self.docker_cmd] + args
 
         try:
-            # Platform-specific adjustments
+            # Platform specific adjustments
             if self.platform_info['is_windows']:
-                # On Windows, ensure proper shell handling
+
                 result = subprocess.run(
                     cmd,
                     capture_output=True,
                     text=True,
                     timeout=self.timeout,
                     cwd=cwd,
-                    shell=False  # Don't use shell on Windows to avoid cmd.exe issues
+                    shell=False
                 )
             else:
                 # Linux/macOS

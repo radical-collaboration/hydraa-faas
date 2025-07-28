@@ -1,5 +1,5 @@
 """
-Optimized Knative platform adapter for FaaS agent
+Knative platform adapter for FaaS agent
 Handles deployment, invocation, and management of Knative services
 """
 
@@ -49,7 +49,7 @@ class KnativePlatform(BasePlatform):
     async def health_check(self) -> bool:
         """Check if Knative platform is healthy"""
         try:
-            # Check if kn CLI is available
+            # check if kn cli is available
             proc = await asyncio.create_subprocess_exec(
                 'kn', 'version',
                 stdout=asyncio.subprocess.PIPE,
@@ -61,7 +61,7 @@ class KnativePlatform(BasePlatform):
                 logger.error(f"kn CLI not available: {stderr.decode()}")
                 return False
 
-            # Check if kubectl can connect to cluster
+            # check if kubectl can connect to cluster
             proc = await asyncio.create_subprocess_exec(
                 'kubectl', 'get', 'namespace', self.namespace,
                 stdout=asyncio.subprocess.PIPE,
@@ -73,7 +73,7 @@ class KnativePlatform(BasePlatform):
                 logger.error(f"Cannot access namespace {self.namespace}: {stderr.decode()}")
                 return False
 
-            # Check Knative serving components
+            # check knative serving components
             proc = await asyncio.create_subprocess_exec(
                 'kubectl', 'get', 'pods', '-n', 'knative-serving',
                 '--field-selector=status.phase=Running',
@@ -506,17 +506,17 @@ CMD ["node", "server.js"]
                 sock.close()
 
                 if result != 0:  # Port is available
-                    # Start kubectl proxy
+                    # start kubectl proxy
                     proc = await asyncio.create_subprocess_exec(
                         'kubectl', 'proxy', f'--port={port}',
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE
                     )
 
-                    # Wait for proxy to start
+                    # wait for proxy to start
                     await asyncio.sleep(2)
 
-                    # Verify proxy is running
+                    # verify proxy is running
                     try:
                         async with httpx.AsyncClient(timeout=5.0) as client:
                             response = await client.get(f"http://localhost:{port}/api/v1")
@@ -534,7 +534,7 @@ CMD ["node", "server.js"]
     async def _stop_kubectl_proxy(self, port: int):
         """Stop kubectl proxy"""
         try:
-            # Find and kill the proxy process (cross-platform)
+            # find and kill the proxy process (cross platform)
             if os.name == 'nt':  # Windows
                 cmd = ['taskkill', '/F', '/IM', 'kubectl.exe']
             else:  # Linux/macOS
@@ -568,7 +568,7 @@ CMD ["node", "server.js"]
             result = json.loads(stdout.decode())
             services = result.get("items", [])
 
-            # Format services for consistent response
+            # format services for consistent response
             formatted_services = []
             for service in services:
                 metadata = service.get("metadata", {})
@@ -614,9 +614,9 @@ CMD ["node", "server.js"]
             if proc.returncode != 0:
                 error_msg = stderr.decode() if stderr else "Unknown deletion error"
                 logger.warning(f"Delete command failed: {error_msg}")
-                # Don't raise error - service might not exist
+                # dont raise error service might not exist
 
-            # Clear from image cache
+            # clear from image cache
             cache_keys_to_remove = [key for key in self.image_cache.keys() if func_id in key]
             for key in cache_keys_to_remove:
                 del self.image_cache[key]
@@ -630,7 +630,7 @@ CMD ["node", "server.js"]
     async def get_metrics(self) -> Dict[str, Any]:
         """Get Knative platform metrics"""
         try:
-            # Get basic cluster metrics
+            # get basic cluster metrics
             cmd = ['kubectl', 'top', 'pods', '--namespace', self.namespace, '--no-headers']
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -651,7 +651,7 @@ CMD ["node", "server.js"]
                                 'memory': parts[2]
                             })
 
-            # Get service count
+            # get service count
             services = await self.list_functions()
 
             return {
@@ -678,7 +678,7 @@ CMD ["node", "server.js"]
                 'local_registry': self._is_local_registry()
             }
 
-            # Get Knative version
+            # get Knative version
             cmd = ['kn', 'version']
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -690,7 +690,7 @@ CMD ["node", "server.js"]
             if proc.returncode == 0:
                 info['kn_version'] = stdout.decode().strip()
 
-            # Get Knative serving status
+            # get Knative serving status
             cmd = ['kubectl', 'get', 'pods', '-n', 'knative-serving', '-o', 'json']
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -710,7 +710,7 @@ CMD ["node", "server.js"]
                     })
                 info['knative_pods'] = knative_pods
 
-            # Get supported runtimes
+            # get supported runtimes
             info['supported_runtimes'] = list(self.RUNTIME_TO_BASE_IMAGE.keys())
 
             return info

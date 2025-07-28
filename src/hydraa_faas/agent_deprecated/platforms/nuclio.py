@@ -1,5 +1,5 @@
 """
-Cross-platform Nuclio platform adapter for FaaS agent
+Nuclio platform adapter for FaaS agent
 Handles source and image-based deployments for Minikube vs GKE.
 """
 
@@ -128,7 +128,7 @@ class NuclioPlatform(BasePlatform):
         return config
 
     def _merge_spec_defaults(self, spec: Dict[str, Any], defaults: Dict[str, Any]):
-        """Merge default configuration values, handling build commands correctly."""
+        """Merge default configuration values handling build commands."""
         for key, value in defaults.items():
             if key in ['handler', 'runtime', 'image']: continue
             if key == 'build' and 'build' in spec:
@@ -202,13 +202,13 @@ class NuclioPlatform(BasePlatform):
 
     async def invoke(self, func_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """
-        FIXED: Invoke a function using the efficient internal Kubernetes service URL.
+        Invoke a function using the efficient internal Kubernetes service URL.
         This method does NOT require an Ingress to be configured for the function.
         """
         start_time = time.time()
 
         # Construct the internal Kubernetes DNS name for the service
-        # Format: <service-name>.<namespace>.svc.cluster.local
+        # Format is like <service-name>.<namespace>.svc.cluster.local
         service_name = f"nuclio-{func_id}"
         internal_url = f"http://{service_name}.{self.namespace}.svc.cluster.local:8080"
 
@@ -261,7 +261,6 @@ class NuclioPlatform(BasePlatform):
                     return f"http://{minikube_ip}:{parts[1]}"
             return None # No external URL found
 
-    # --- Other helper and interface methods remain unchanged ---
     async def _cleanup_existing_function(self, func_name: str):
         try:
             cmd = ['nuctl', 'delete', 'function', func_name, '--platform', self.platform, '--namespace', self.namespace]

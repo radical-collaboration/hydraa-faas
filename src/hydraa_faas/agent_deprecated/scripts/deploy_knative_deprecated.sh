@@ -1,9 +1,5 @@
 #!/bin/bash
 
-# knative + minikube setup script for docker hub
-# works on amazon linux 2, ubuntu, centos, and macos
-# version: 3.0 - docker hub only, no local registry, serving only
-
 set -e
 
 # configuration

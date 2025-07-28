@@ -1,9 +1,5 @@
 #!/bin/bash
 
-# nuclio + minikube setup script
-# works on amazon linux 2, ubuntu, centos, and macos
-# version: 4.2 - minimal and clean
-
 set -e
 
 # configuration

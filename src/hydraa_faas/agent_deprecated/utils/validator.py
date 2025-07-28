@@ -123,7 +123,7 @@ class FunctionValidator:
         errors = []
         python_files = [f for f in file_list if f.endswith('.py') and not f.startswith('__pycache__')]
 
-        # For Python projects, ensure there's at least one function that looks like a handler.
+        # For Python projects make sure theres at least one function that looks like a handler.
         if python_files and not metadata['has_handler_function']:
             errors.append("No function named 'handler', 'main', or similar found in any Python files.")
 
