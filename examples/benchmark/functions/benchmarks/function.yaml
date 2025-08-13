@@ -1,0 +1,130 @@
+apiVersion: "nuclio.io/v1"
+kind: "NuclioFunction"
+metadata:
+  name: dynamic-html-benchmark
+  namespace: nuclio
+spec:
+  description: "Dynamic HTML rendering benchmark function"
+  runtime: "python:3.9"
+  handler: "webapps_100.dynamic_html_110.python.function:handler"
+
+  # Build configuration
+  build:
+    # Commands to run during build
+    commands:
+    # Code entry type - use 'source' to copy entire directory
+    codeEntryType: "source"
+
+    # Path to the source code (relative to where you run nuctl)
+    path: "."
+
+    # Explicitly include the benchmarks directory
+    includePaths:
+      - "benchmarks/**"
+
+    # Exclude unnecessary files
+    excludePaths:
+      - ".git"
+      - "*.pyc"
+      - "__pycache__"
+      - ".pytest_cache"
+      - "*.log"
+      - ".DS_Store"
+
+  # Runtime configuration
+  env:
+    - name: "PYTHONPATH"
+      value: "/opt/nuclio:/opt/nuclio/benchmarks"
+    - name: "FUNCTION_DIR"
+      value: "/opt/nuclio/benchmarks/webapps_100/dynamic_html_110/python"
+
+  # Resources
+  resources:
+    requests:
+      memory: "128Mi"
+      cpu: "100m"
+    limits:
+      memory: "512Mi"
+      cpu: "500m"
+
+  # Scaling configuration
+  minReplicas: 1
+  maxReplicas: 10
+
+  # Target CPU percentage for autoscaling
+  targetCPU: 75
+
+  # HTTP trigger configuration
+  triggers:
+    http:
+      kind: "http"
+      maxWorkers: 4
+      workerAvailabilityTimeoutMilliseconds: 10000
+      attributes:
+        port: 8080
+        ingresses:
+          http:
+            paths:
+              - "/"
+            hostTemplate: "{{ .FunctionName }}.{{ .Namespace }}.svc.cluster.local"
+
+  # Platform-specific configuration
+  platform:
+    attributes:
+      # Mount mode for the function code
+      mountMode: "volume"
+
+      # Network configuration
+      network: "bridge"
+
+      # Restart policy
+      restartPolicy:
+        name: "always"
+        maximumRetryCount: 3
+
+      # Health check
+      healthCheck:
+        path: "/"
+        port: 8080
+        initialDelaySeconds: 30
+        periodSeconds: 10
+        timeoutSeconds: 5
+        successThreshold: 1
+        failureThreshold: 3
+
+  # Data bindings (if needed for storage)
+  dataBindings: {}
+
+  # Function-specific configuration
+  spec:
+    # Build arguments
+    build:
+      functionSourceCode: ""
+
+    # Runtime attributes
+    runtimeAttributes:
+      # Response headers
+      responseHeaders:
+        "Content-Type": "text/html"
+        "X-Powered-By": "Nuclio"
+
+  # Logging
+  loggerSinks:
+    - level: "info"
+      kind: "stdout"
+
+  # Disable default HTTP trigger if you want custom configuration
+  disableDefaultHTTPTrigger: false
+
+  # Service type for the function
+  serviceType: "ClusterIP"
+
+  # Annotations for the function pods
+  annotations:
+    "nuclio.io/function-spec": "dynamic-html-benchmark"
+
+  # Labels for the function
+  labels:
+    "benchmark-type": "webapp"
+    "benchmark-category": "dynamic-html"
+    "runtime": "python"

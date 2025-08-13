@@ -1,0 +1,4 @@
+#time,event,comp,thread,uid,state,msg
+1754476432.4319010,sync_abs,hydraa.services.caas_manager.kubernetes.kubernetes,NuclioInit,,,1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa:127.0.0.1:1754476432.431477:1754476432.4640942:ntp
+1754476432.4324028,bootstrap_start,hydraa.services.caas_manager.kubernetes.kubernetes,NuclioInit,nuclio-7vveatxj,,
+1754476432.4324670,cofigure_start,hydraa.services.caas_manager.kubernetes.kubernetes,NuclioInit,nuclio-7vveatxj,,

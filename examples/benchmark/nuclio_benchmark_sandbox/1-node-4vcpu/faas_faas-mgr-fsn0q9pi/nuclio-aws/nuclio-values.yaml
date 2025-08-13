@@ -1,0 +1,6 @@
+controller.enabled: true
+dashboard.enabled: true
+dashboard.nodePort: 8070
+rbac.create: true
+registry.pushPullUrl: 946358504676.dkr.ecr.us-east-1.amazonaws.com
+registry.secretName: nuclio-registry-creds

@@ -1,0 +1,19 @@
+apiVersion: "nuclio.io/v1beta1"
+kind: NuclioFunction
+metadata:
+  name: test-func
+  namespace: nuclio
+spec:
+  build:
+    baseImage: "quay.io/nuclio/handler-builder-python-onbuild:1.14.11-arm64"
+    commands:
+      - "pip install msgpack"
+    path: "."
+    registry: "dockerhub.io/husseinmohab"
+  handler: "handler:handler"
+  runtime: "python:3.9"
+  triggers:
+    http:
+      kind: http
+      attributes:
+        serviceType: NodePort
