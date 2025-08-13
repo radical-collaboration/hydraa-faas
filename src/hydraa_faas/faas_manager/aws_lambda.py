@@ -1,809 +1,667 @@
-"""
-AWS Lambda Provider - Production-ready version with improved state management
-Handles Lambda function deployments with clean error handling and minimal complexity
+# -*- coding: utf-8 -*-
+"""AWS Lambda provider - Refactored for better HYDRA integration.
+
+This module handles AWS Lambda deployments while following HYDRA patterns
+and using existing Task attributes effectively.
 """
 
-import os
 import json
-import time
+import os
 import queue
 import threading
-from pathlib import Path
-from typing import Dict, Any, List, Optional, Union
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
-from functools import wraps
-from dataclasses import dataclass
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Union
 
 import boto3
-from botocore.exceptions import ClientError
 from botocore.config import Config
+from botocore.exceptions import ClientError
 
-# import from hydraa
 from hydraa import Task
-from hydraa.services.caas_manager.utils.misc import generate_id
 
-# import our utilities
 from ..utils.exceptions import DeploymentException, InvocationException
 from ..utils.packaging import create_deployment_package
-from ..utils.resource_manager import ResourceManager
 from ..utils.registry import RegistryManager, RegistryConfig, RegistryType
+from ..utils.resource_manager import ResourceManager
 
-# constants
+# Constants
 LAMBDA_MAX_TIMEOUT = 900  # 15 minutes
 LAMBDA_MIN_MEMORY = 128
 LAMBDA_MAX_MEMORY = 10240
-LAMBDA_MAX_ZIP_SIZE = 50 * 1024 * 1024  # 50mb
 DEFAULT_PYTHON_RUNTIME = 'python3.9'
 
-# retry configuration
-MAX_RETRIES = 3
-RETRY_DELAY = 1
-RETRY_BACKOFF = 2
 
-# bulk processing configuration following hydraa pattern with strings
-MAX_BULK_SIZE = os.environ.get('FAAS_MAX_BULK_SIZE', '10')
-MAX_BULK_TIME = os.environ.get('FAAS_MAX_BULK_TIME', '2')
-MIN_BULK_TIME = os.environ.get('FAAS_MIN_BULK_TIME', '0.1')
+class AWSClientPool:
+    """Singleton pool for AWS clients with connection reuse."""
+    _instance = None
+    _clients = {}
+    _lock = threading.Lock()
 
-# task states
-TASK_STATE_PENDING = 'PENDING'
-TASK_STATE_BUILDING = 'BUILDING'
-TASK_STATE_DEPLOYING = 'DEPLOYING'
-TASK_STATE_DEPLOYED = 'DEPLOYED'
-TASK_STATE_FAILED = 'FAILED'
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
 
-# graceful shutdown timeout
-GRACEFUL_SHUTDOWN_TIMEOUT = int(os.environ.get('LAMBDA_GRACEFUL_SHUTDOWN_TIMEOUT', '30'))
+    @lru_cache(maxsize=32)
+    def get_client(self, service: str, region: str, access_key: str, secret_key: str):
+        """Get or create a cached client."""
+        key = f"{service}:{region}:{access_key[:8]}"
 
+        with self._lock:
+            if key not in self._clients:
+                config = Config(
+                    region_name=region,
+                    retries={'max_attempts': 5, 'mode': 'adaptive'},
+                    max_pool_connections=50  # Increase connection pool
+                )
 
-def retry_on_error(max_attempts=MAX_RETRIES, delay=RETRY_DELAY, backoff=RETRY_BACKOFF):
-    """Decorator for exponential backoff retry logic"""
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            last_exception = None
-            for attempt in range(max_attempts):
-                try:
-                    return func(*args, **kwargs)
-                except ClientError as e:
-                    last_exception = e
-                    if attempt < max_attempts - 1:
-                        # dont retry on certain errors
-                        error_code = e.response['Error']['Code']
-                        if error_code in ['ResourceConflictException', 'InvalidParameterValueException']:
-                            raise
+                self._clients[key] = boto3.client(
+                    service,
+                    aws_access_key_id=access_key,
+                    aws_secret_access_key=secret_key,
+                    config=config
+                )
 
-                        wait_time = delay * (backoff ** attempt)
-                        time.sleep(wait_time)
-                    else:
-                        raise
-            raise last_exception
-        return wrapper
-    return decorator
-
-
-@dataclass
-class LambdaConfig:
-    """Lambda function configuration"""
-    function_name: str
-    runtime: str
-    role: str
-    handler: str
-    timeout: int
-    memory_size: int
-    environment: Optional[Dict[str, str]] = None
-    vpc_config: Optional[Dict[str, Any]] = None
-    layers: Optional[List[str]] = None
-    tags: Optional[Dict[str, str]] = None
+            return self._clients[key]
 
 
 class AwsLambda:
-    """
-    AWS Lambda provider for FaaS Manager.
-
-    Simplified implementation focusing on core Lambda operations
-    with clean error handling and resource management.
-    """
+    """AWS Lambda provider following HYDRA patterns."""
 
     def __init__(self,
                  sandbox: str,
                  manager_id: str,
-                 cred: dict,
+                 cred: Dict[str, Any],
                  asynchronous: bool,
                  auto_terminate: bool,
-                 log,
-                 resource_manager: Optional[ResourceManager] = None,
-                 resource_config: Optional[Dict[str, Any]] = None):
-        """Initialize AWS Lambda provider"""
+                 log: Any,
+                 resource_config: Dict[str, Any],
+                 profiler: Any):
+        """Initialize AWS Lambda provider.
+
+        Args:
+            sandbox: Directory for temporary files.
+            manager_id: Unique manager identifier.
+            cred: AWS credentials dictionary.
+            asynchronous: Whether to process asynchronously.
+            auto_terminate: Whether to cleanup on shutdown.
+            log: HYDRA logger instance.
+            resource_config: Provider configuration.
+            profiler: HYDRA profiler instance.
+        """
         self.sandbox = sandbox
         self.manager_id = manager_id
         self.logger = log
+        self.profiler = profiler
         self.asynchronous = asynchronous
         self.auto_terminate = auto_terminate
-        self.status = False
+        self.resource_config = resource_config
 
-        # validate credentials
-        self._validate_credentials(cred)
+        # AWS clients using connection pool
         self.region = cred['region_name']
+        client_pool = AWSClientPool()
 
-        # resource manager
-        self.resource_manager = resource_manager or ResourceManager()
-
-        # registry manager integration through resource manager
-        self.registry_manager = self.resource_manager.registry_manager if hasattr(
-            self.resource_manager, 'registry_manager'
-        ) else RegistryManager(self.logger)
-
-        # generate unique run id
-        self.run_id = generate_id(prefix='lambda', length=8)
-
-        # aws clients with connection pooling
-        config = Config(
-            region_name=self.region,
-            retries={'max_attempts': 3, 'mode': 'adaptive'},
-            max_pool_connections=50
-        )
-
-        self._lambda_client = boto3.client(
+        self._lambda_client = client_pool.get_client(
             'lambda',
-            aws_access_key_id=cred['aws_access_key_id'],
-            aws_secret_access_key=cred['aws_secret_access_key'],
-            config=config
+            self.region,
+            cred['aws_access_key_id'],
+            cred['aws_secret_access_key']
         )
 
-        self._iam_client = boto3.client(
+        self._iam_client = client_pool.get_client(
             'iam',
-            aws_access_key_id=cred['aws_access_key_id'],
-            aws_secret_access_key=cred['aws_secret_access_key'],
-            config=config
+            self.region,
+            cred['aws_access_key_id'],
+            cred['aws_secret_access_key']
         )
 
-        self._ecr_client = boto3.client(
+        self._ecr_client = client_pool.get_client(
             'ecr',
-            aws_access_key_id=cred['aws_access_key_id'],
-            aws_secret_access_key=cred['aws_secret_access_key'],
-            config=config
+            self.region,
+            cred['aws_access_key_id'],
+            cred['aws_secret_access_key']
         )
 
-        # configure registry manager with ecr client
-        self.registry_manager._aws_clients = {'ecr': self._ecr_client}
+        # Resource management
+        self.resource_manager = ResourceManager(logger=self.logger)
+        self.registry_manager = RegistryManager(
+            logger=self.logger,
+            aws_clients={'ecr': self._ecr_client}
+        )
 
-        # task tracking with thread safe state management
-        self._task_id = 0
-        self._task_lock = threading.Lock()
-        self._deployed_functions = OrderedDict()
-        self._functions_book = OrderedDict()
-        self._active_deployments = set()
+        # Function tracking
+        self._functions: Dict[str, Dict[str, Any]] = {}
+        self._functions_lock = threading.RLock()
 
-        # queue management following hydraa pattern
+        # Processing queue for async mode
         self.incoming_q = queue.Queue()
-        self.outgoing_q = queue.Queue()
-        self.internal_q = queue.Queue()
         self._terminate = threading.Event()
-        self._shutdown_complete = threading.Event()
 
-        # thread pool for parallel operations
-        self.executor = ThreadPoolExecutor(max_workers=5)
-
-        # setup resources if configured
-        if cred.get('auto_setup_resources', True):
-            self._setup_resources()
-
-        # start worker thread
-        self.worker_thread = threading.Thread(
-            target=self._get_work,
-            name='LambdaWorker',
-            daemon=True
+        # Thread pool for parallel deployments
+        self.executor = ThreadPoolExecutor(
+            max_workers=10,
+            thread_name_prefix="Lambda"
         )
 
-        # check if thread is already started following hydraa pattern
-        if not self.worker_thread.is_alive():
+        # Initialize resources
+        self._setup_resources()
+
+        # Start worker if async
+        if self.asynchronous:
+            self.worker_thread = threading.Thread(
+                target=self._worker,
+                name='LambdaWorker',
+                daemon=True
+            )
             self.worker_thread.start()
 
-        self.status = True
-        self.logger.info(f"AWS Lambda provider initialized: {self.manager_id}")
+    def _setup_resources(self) -> None:
+        """Set up AWS resources with HYDRA patterns."""
+        self.logger.trace("Setting up AWS Lambda resources")
+        self.profiler.prof('lambda_setup_start', uid=self.manager_id)
 
-    def _validate_credentials(self, cred: dict):
-        """Validate AWS credentials"""
-        required = ['aws_access_key_id', 'aws_secret_access_key', 'region_name']
-        missing = [field for field in required if not cred.get(field)]
-        if missing:
-            raise ValueError(f"Missing required AWS credentials: {missing}")
+        # Create IAM role if not provided
+        if not self.resource_config.get('iam_role'):
+            role_name = f"hydra-lambda-role-{self.manager_id}"
+            role_arn = self.resource_manager.create_aws_iam_role(
+                role_name,
+                self._iam_client
+            )
+            self.resource_config['iam_role'] = role_arn
 
-    def _setup_resources(self):
-        """Setup or load AWS resources"""
+        # Setup ECR if container support enabled
+        if self.resource_config.get('enable_container_support', False):
+            repo_name = f"hydra-faas-{self.manager_id}"
+            repo_uri = self.resource_manager.create_aws_ecr_repository(
+                repo_name,
+                self._ecr_client
+            )
+            ecr_config = RegistryConfig(
+                type=RegistryType.ECR,
+                region=self.region
+            )
+            self.registry_manager.configure_registry('aws_ecr', ecr_config)
+
+        self.profiler.prof('lambda_setup_end', uid=self.manager_id)
+        self.logger.trace("AWS Lambda resources ready")
+
+    def _worker(self) -> None:
+        """Worker thread for async processing."""
+        while not self._terminate.is_set():
+            try:
+                tasks = self.incoming_q.get(timeout=1)
+                if isinstance(tasks, list):
+                    self.deploy_batch_optimized(tasks)
+                else:
+                    self.deploy_function(tasks)
+            except queue.Empty:
+                continue
+            except Exception as e:
+                self.logger.error(f"Lambda worker error: {e}")
+
+    def deploy_function(self, task: Task) -> str:
+        """Deploy a single function from a HYDRA Task.
+
+        Args:
+            task: HYDRA Task object.
+
+        Returns:
+            Function identifier (ARN).
+        """
+        self.profiler.prof('lambda_deploy_start', uid=str(task.id))
+
         try:
-            # try to load existing resources first
-            if self.resource_manager.aws_resources.iam_role_arn:
-                self.logger.info("Using existing AWS resources")
-                return
+            # Extract FaaS configuration from Task
+            faas_config = self._extract_faas_config(task)
 
-            # create new resources
-            self.logger.info("Setting up AWS resources")
+            # Validate configuration
+            self._validate_faas_config(faas_config, self._determine_deployment_type(task))
 
-            role_name = generate_id(prefix='faas-lambda-role', length=8)
-            repo_name = generate_id(prefix='faas-functions', length=8)
+            # Generate unique function name
+            function_name = self._generate_function_name(task)
 
-            resources = self.resource_manager.setup_aws_resources(
-                iam_client=self._iam_client,
-                ecr_client=self._ecr_client,
-                region=self.region,
-                role_name=role_name,
-                repo_name=repo_name,
-                reuse_existing=True
+            # Determine deployment type
+            deployment_type = self._determine_deployment_type(task)
+
+            # Create deployment package
+            package_content = self._create_package(task, deployment_type)
+
+            # Deploy to Lambda
+            function_arn = self._deploy_to_lambda(
+                task,
+                function_name,
+                package_content,
+                deployment_type,
+                faas_config
             )
 
-            self.logger.info(f"AWS resources ready: IAM role={resources.iam_role_name}, "
-                           f"ECR repo={resources.ecr_repository_name}")
+            # Track deployment
+            with self._functions_lock:
+                self._functions[function_name] = {
+                    'arn': function_arn,
+                    'task_id': str(task.id),
+                    'deployment_type': deployment_type
+                }
+
+            self.profiler.prof('lambda_deploy_end', uid=str(task.id))
+            self.logger.trace(f"Deployed Lambda function: {function_name}")
+
+            return function_name
 
         except Exception as e:
-            self.logger.warning(f"Resource setup error: {e}. Will create resources on demand.")
+            self.profiler.prof('lambda_deploy_failed', uid=str(task.id))
+            raise DeploymentException(f"Lambda deployment failed: {e}")
 
-    def _get_work(self):
-        """Worker thread to process deployment requests following hydraa bulk pattern"""
-        bulk = list()
-        # convert strings to proper types following hydraa pattern
-        max_bulk_size = int(MAX_BULK_SIZE)
-        max_bulk_time = float(MAX_BULK_TIME)
-        min_bulk_time = float(MIN_BULK_TIME)
+    def deploy_batch_optimized(self, tasks: List[Task]) -> List[str]:
+        """Deploy multiple functions in parallel with optimizations."""
+        self.profiler.prof('lambda_batch_start', uid=self.manager_id)
 
-        while not self._terminate.is_set():
-            now = time.time()  # time of last submission
-            timeout_start = now
-
-            # collect tasks for min bulk time
-            while time.time() - now < max_bulk_time:
-                try:
-                    # add absolute timeout to prevent infinite waiting
-                    remaining_time = max(0.1, min_bulk_time - (time.time() - timeout_start))
-                    task = self.incoming_q.get(block=True, timeout=remaining_time)
-                except queue.Empty:
-                    task = None
-
-                if task:
-                    bulk.append(task)
-
-                if len(bulk) >= max_bulk_size:
-                    break
-
-            if bulk:
-                # use lock pattern consistent with hydraa managers
-                with self._task_lock:
-                    self._process_bulk(bulk)
-                bulk = list()
-
-        # signal that worker thread has completed
-        self.logger.info("Lambda worker thread shutting down")
-
-    def _process_bulk(self, tasks: List[Task]):
-        """Process a bulk of tasks"""
+        # Group tasks by deployment type for optimization
+        tasks_by_type = {}
         for task in tasks:
-            try:
-                self._process_task(task)
-            except Exception as e:
-                self.logger.error(f"Failed to process task: {e}")
-                with self._task_lock:
-                    task.state = TASK_STATE_FAILED
-                    if not task.done():
+            dep_type = self._determine_deployment_type(task)
+            tasks_by_type.setdefault(dep_type, []).append(task)
+
+        results = []
+        all_futures = {}
+
+        # Process each group with type-specific optimizations
+        for dep_type, task_group in tasks_by_type.items():
+            if dep_type == 'zip':
+                # Parallelize packaging
+                with ThreadPoolExecutor(max_workers=10) as package_executor:
+                    package_futures = {}
+                    for task in task_group:
+                        future = package_executor.submit(self._prepare_zip_deployment, task)
+                        package_futures[future] = task
+
+                    # Deploy as packages complete
+                    for future in as_completed(package_futures):
+                        task = package_futures[future]
+                        try:
+                            function_name, package_content, faas_config = future.result()
+                            deploy_future = self.executor.submit(
+                                self._deploy_to_lambda,
+                                task, function_name, package_content, dep_type, faas_config
+                            )
+                            all_futures[deploy_future] = (task, function_name)
+                        except Exception as e:
+                            task.set_exception(e)
+
+            elif dep_type == 'container':
+                # Batch prepare container deployments
+                deployment_configs = []
+                for task in task_group:
+                    try:
+                        config = self._prepare_container_deployment(task)
+                        deployment_configs.append((task, config))
+                    except Exception as e:
                         task.set_exception(e)
 
-    def _process_task(self, task: Task):
-        """Process a single deployment task with proper state management"""
-        try:
-            # assign task id and name with thread safety
-            with self._task_lock:
-                task.id = self._task_id
-                task.name = f'lambda-function-{self._task_id}'
-                self._task_id += 1
-                self._functions_book[task.name] = task
-                self._active_deployments.add(task.name)
+                # Deploy containers in parallel
+                for task, (function_name, image_uri, faas_config) in deployment_configs:
+                    future = self.executor.submit(
+                        self._deploy_to_lambda,
+                        task, function_name, image_uri, dep_type, faas_config
+                    )
+                    all_futures[future] = (task, function_name)
 
-            # update task state
-            task.state = TASK_STATE_PENDING
-            self.logger.info(f"Deploying Lambda function: {task.name}")
+        # Collect results
+        for future in as_completed(all_futures):
+            task, function_name = all_futures[future]
+            try:
+                function_arn = future.result()
+                # Track deployment
+                with self._functions_lock:
+                    self._functions[function_name] = {
+                        'arn': function_arn,
+                        'task_id': str(task.id),
+                        'deployment_type': self._determine_deployment_type(task)
+                    }
+                results.append(function_name)
+                task.set_result(function_name)
+            except Exception as e:
+                self.logger.error(f"Failed to deploy task {task.id}: {e}")
+                task.set_exception(e)
 
-            # set running state before deployment
-            task.state = TASK_STATE_BUILDING
-            if not task.done():
-                task.set_running_or_notify_cancel()
+        self.profiler.prof('lambda_batch_end', uid=self.manager_id)
+        return results
 
-            # deploy based on task type
-            task.state = TASK_STATE_DEPLOYING
-            if hasattr(task, 'image') and task.image:
-                function_arn = self._deploy_container_function(task)
+    def _prepare_zip_deployment(self, task: Task) -> tuple:
+        """Prepare a zip deployment package."""
+        faas_config = self._extract_faas_config(task)
+        self._validate_faas_config(faas_config, 'zip')
+        function_name = self._generate_function_name(task)
+        package_content = self._create_package(task, 'zip')
+        return function_name, package_content, faas_config
+
+    def _prepare_container_deployment(self, task: Task) -> tuple:
+        """Prepare a container deployment."""
+        faas_config = self._extract_faas_config(task)
+        self._validate_faas_config(faas_config, 'container')
+        function_name = self._generate_function_name(task)
+        image_uri = self._create_package(task, 'container')
+        return function_name, image_uri, faas_config
+
+    def _extract_faas_config(self, task: Task) -> Dict[str, Any]:
+        """Extract FaaS configuration from Task's env_var."""
+        config = {}
+
+        if task.env_var:
+            for var in task.env_var:
+                if isinstance(var, str) and '=' in var:
+                    key, value = var.split('=', 1)
+                    if key.startswith('FAAS_'):
+                        config[key.replace('FAAS_', '').lower()] = value
+
+        # Defaults
+        config.setdefault('handler', 'handler.handler')
+        config.setdefault('runtime', DEFAULT_PYTHON_RUNTIME)
+        config.setdefault('timeout', '30')
+        config.setdefault('source', '')
+
+        return config
+
+    def _validate_faas_config(self, config: Dict[str, Any], deployment_type: str) -> None:
+        """Validate FaaS configuration before deployment."""
+        # Validate handler format
+        handler = config.get('handler', '')
+        if deployment_type == 'zip' and (not handler or '.' not in handler):
+            raise DeploymentException(f"Invalid handler format: {handler}. Expected 'module.function'")
+
+        # Validate runtime
+        runtime = config.get('runtime', '')
+        valid_runtimes = ['python3.9', 'python3.10', 'python3.11', 'python3.12']
+        if deployment_type == 'zip' and runtime not in valid_runtimes:
+            raise DeploymentException(f"Invalid runtime: {runtime}. Valid options: {valid_runtimes}")
+
+        # Validate timeout
+        timeout = int(config.get('timeout', 30))
+        if timeout < 1 or timeout > LAMBDA_MAX_TIMEOUT:
+            raise DeploymentException(f"Invalid timeout: {timeout}. Must be between 1 and {LAMBDA_MAX_TIMEOUT}")
+
+        # Validate source path for source-based deployments
+        if deployment_type in ['zip', 'source-to-image']:
+            source = config.get('source', '')
+            if source and not os.path.exists(source):
+                raise DeploymentException(f"Source path does not exist: {source}")
+
+    def _generate_function_name(self, task: Task) -> str:
+        """Generate Lambda-compatible function name."""
+        base_name = task.name or f"task-{task.id}"
+        # Lambda naming constraints
+        clean_name = ''.join(c for c in base_name if c.isalnum() or c in '-_')
+        return f"hydra-{self.manager_id}-{clean_name}"[:64]  # Lambda limit
+
+    def _determine_deployment_type(self, task: Task) -> str:
+        """Determine deployment type from Task attributes."""
+        if task.image and task.image != 'python:3.9':
+            return 'container'
+        return 'zip'
+
+    def _create_package(self, task: Task, deployment_type: str) -> Union[bytes, str]:
+        """Create deployment package based on type."""
+        faas_config = self._extract_faas_config(task)
+
+        if deployment_type == 'container':
+            # Use task.image for container deployments
+            if task.image.startswith('ecr:'):
+                # Pre-built image
+                return task.image.replace('ecr:', '')
             else:
-                function_arn = self._deploy_zip_function(task)
+                # Build from source
+                source_path = faas_config.get('source', '')
+                if not source_path:
+                    raise DeploymentException("Container deployment requires source_path")
 
-            # update tracking with thread safety
-            with self._task_lock:
-                task.arn = function_arn
-                self._deployed_functions[task.name] = {
-                    'arn': function_arn,
-                    'created_at': time.time()
-                }
-                self._active_deployments.discard(task.name)
+                repo_uri = self.resource_manager.aws_resources.ecr_repository_uri
+                if not repo_uri:
+                    raise DeploymentException("ECR repository not configured")
 
-            # complete the task
-            task.state = TASK_STATE_DEPLOYED
-            result = {
-                'function_name': task.name,
-                'function_arn': function_arn,
-                'deployed_at': time.time()
-            }
-
-            # set result only if task hasnt been cancelled
-            if not task.done():
-                task.set_result(result)
-
-            # send status update
-            self.outgoing_q.put({
-                'function_name': task.name,
-                'state': 'deployed',
-                'message': f'Function {task.name} deployed successfully'
-            })
-            self.logger.info(f'Function {task.name} deployed: {function_arn}')
-
-        except Exception as e:
-            self.logger.error(f'Failed to deploy function: {e}')
-            with self._task_lock:
-                self._active_deployments.discard(task.name)
-                task.state = TASK_STATE_FAILED
-                if not task.done():
-                    task.set_exception(e)
-
-            self.outgoing_q.put({
-                'function_name': task.name,
-                'state': 'failed',
-                'error': str(e)
-            })
-
-    @retry_on_error()
-    def _deploy_zip_function(self, task: Task) -> str:
-        """Deploy Lambda function from ZIP package"""
-        self.logger.info(f'Deploying {task.name} from zip package')
-
-        # create deployment package
-        if hasattr(task, 'source_path') and task.source_path:
-            zip_content = create_deployment_package(task.source_path)
-        elif hasattr(task, 'handler_code') and task.handler_code:
-            zip_content = self._create_inline_package(task)
+                image_uri, _, _ = self.registry_manager.build_and_push_image(
+                    source_path=source_path,
+                    repository_uri=repo_uri,
+                    image_tag=task.name
+                )
+                return image_uri
         else:
-            raise ValueError("Task must specify source_path or handler_code")
+            # ZIP deployment
+            if task.cmd and len(task.cmd) > 2:
+                # Inline code from task.cmd
+                code = task.cmd[2] if task.cmd[0] == 'python' and task.cmd[1] == '-c' else ''
+                if code:
+                    # Create temporary source file
+                    source_dir = os.path.join(self.sandbox, f"task_{task.id}")
+                    os.makedirs(source_dir, exist_ok=True)
 
-        # validate package size
-        if len(zip_content) > LAMBDA_MAX_ZIP_SIZE:
-            raise ValueError(f"Deployment package too large: {len(zip_content)} bytes")
+                    handler_file = os.path.join(source_dir, "handler.py")
+                    with open(handler_file, 'w') as f:
+                        f.write(code)
 
-        # get or create iam role
-        role_arn = self._ensure_iam_role()
+                    zip_content, _, _ = create_deployment_package(source_dir)
+                    return zip_content
 
-        # prepare function configuration
-        config = LambdaConfig(
-            function_name=task.name,
-            runtime=getattr(task, 'runtime', DEFAULT_PYTHON_RUNTIME),
-            role=role_arn,
-            handler=getattr(task, 'handler', 'handler.handler'),
-            timeout=min(getattr(task, 'timeout', 30), LAMBDA_MAX_TIMEOUT),
-            memory_size=self._normalize_memory(task.memory),
-            environment={'Variables': getattr(task, 'env_vars', {})},
-            vpc_config=getattr(task, 'vpc_config', None),
-            layers=getattr(task, 'layers', [])[:5],  # max 5 layers
-            tags=getattr(task, 'tags', {})
+            # External source
+            source_path = faas_config.get('source', '')
+            if source_path:
+                zip_content, _, _ = create_deployment_package(source_path)
+                return zip_content
+
+            raise DeploymentException("No source code provided for deployment")
+
+    def _deploy_to_lambda(self, task: Task, function_name: str,
+                          package: Union[bytes, str], deployment_type: str,
+                          faas_config: Dict[str, Any]) -> str:
+        """Deploy package to AWS Lambda."""
+        # Use Task's vcpus and memory for Lambda configuration
+        memory = max(
+            min(int(task.memory or 256), LAMBDA_MAX_MEMORY),
+            LAMBDA_MIN_MEMORY
         )
 
-        # create or update function
-        return self._create_or_update_function(config, zip_content=zip_content)
-
-    @retry_on_error()
-    def _deploy_container_function(self, task: Task) -> str:
-        """Deploy Lambda function from container image"""
-        self.logger.info(f'Deploying {task.name} from container image')
-
-        # get or create iam role
-        role_arn = self._ensure_iam_role()
-
-        # handle image uri
-        if hasattr(task, 'build_image') and task.build_image:
-            image_uri = self._build_and_push_image(task)
-        else:
-            image_uri = task.image
-
-        # prepare function configuration
-        config = LambdaConfig(
-            function_name=task.name,
-            runtime='',  # not used for container images
-            role=role_arn,
-            handler='',  # not used for container images
-            timeout=min(getattr(task, 'timeout', 30), LAMBDA_MAX_TIMEOUT),
-            memory_size=self._normalize_memory(task.memory),
-            environment={'Variables': getattr(task, 'env_vars', {})},
-            vpc_config=getattr(task, 'vpc_config', None),
-            tags=getattr(task, 'tags', {})
+        timeout = min(
+            int(faas_config.get('timeout', 30)),
+            LAMBDA_MAX_TIMEOUT
         )
 
-        # create or update function
-        return self._create_or_update_function(config, image_uri=image_uri)
+        params = {
+            'FunctionName': function_name,
+            'Role': self.resource_config.get('iam_role'),
+            'Timeout': timeout,
+            'MemorySize': memory,
+            'Environment': {
+                'Variables': self._get_environment_variables(task)
+            }
+        }
 
-    @retry_on_error()
-    def _create_or_update_function(self, config: LambdaConfig,
-                                   zip_content: bytes = None,
-                                   image_uri: str = None) -> str:
-        """Create or update Lambda function"""
-        try:
-            # try to create function
-            params = {
-                'FunctionName': config.function_name,
-                'Role': config.role,
-                'Timeout': config.timeout,
-                'MemorySize': config.memory_size,
-                'Publish': True
+        if deployment_type == 'container':
+            params.update({
+                'PackageType': 'Image',
+                'Code': {'ImageUri': package}
+            })
+        else:
+            params.update({
+                'Runtime': faas_config.get('runtime', DEFAULT_PYTHON_RUNTIME),
+                'Handler': faas_config.get('handler', 'handler.handler'),
+                'Code': {'ZipFile': package}
+            })
+
+        # Add VPC config if available
+        if self.resource_config.get('subnet_ids'):
+            params['VpcConfig'] = {
+                'SubnetIds': self.resource_config['subnet_ids'],
+                'SecurityGroupIds': self.resource_config.get('security_groups', [])
             }
 
-            if zip_content:
-                params.update({
-                    'Runtime': config.runtime,
-                    'Handler': config.handler,
-                    'Code': {'ZipFile': zip_content}
-                })
-            else:
-                params.update({
-                    'Code': {'ImageUri': image_uri},
-                    'PackageType': 'Image'
-                })
-
-            # add optional parameters
-            if config.environment:
-                params['Environment'] = config.environment
-            if config.vpc_config:
-                params['VpcConfig'] = config.vpc_config
-            if config.layers:
-                params['Layers'] = config.layers
-            if config.tags:
-                params['Tags'] = config.tags
-
+        try:
             response = self._lambda_client.create_function(**params)
+
+            # Wait for function to be active
+            waiter = self._lambda_client.get_waiter('function_active_v2')
+            waiter.wait(FunctionName=function_name)
+
             return response['FunctionArn']
 
         except ClientError as e:
             if e.response['Error']['Code'] == 'ResourceConflictException':
-                # function exists so update it
-                self.logger.info(f"Function {config.function_name} exists, updating...")
-
-                # update code
-                if zip_content:
-                    self._lambda_client.update_function_code(
-                        FunctionName=config.function_name,
-                        ZipFile=zip_content,
-                        Publish=True
-                    )
-                else:
-                    self._lambda_client.update_function_code(
-                        FunctionName=config.function_name,
-                        ImageUri=image_uri,
-                        Publish=True
-                    )
-
-                # update configuration
-                update_params = {
-                    'FunctionName': config.function_name,
-                    'Role': config.role,
-                    'Timeout': config.timeout,
-                    'MemorySize': config.memory_size
-                }
-
-                if config.runtime:  # only for zip functions
-                    update_params['Runtime'] = config.runtime
-                    update_params['Handler'] = config.handler
-
-                if config.environment:
-                    update_params['Environment'] = config.environment
-                if config.vpc_config:
-                    update_params['VpcConfig'] = config.vpc_config
-                if config.layers:
-                    update_params['Layers'] = config.layers
-
-                response = self._lambda_client.update_function_configuration(**update_params)
-                return response['FunctionArn']
+                # Update existing function
+                return self._update_function(function_name, package, deployment_type, params)
             else:
                 raise
 
-    def _ensure_iam_role(self) -> str:
-        """Ensure IAM role exists for Lambda execution"""
-        # check if we have a saved role
-        if self.resource_manager.aws_resources.iam_role_arn:
-            return self.resource_manager.aws_resources.iam_role_arn
+    def _update_function(self, function_name: str, package: Union[bytes, str],
+                         deployment_type: str, params: Dict[str, Any]) -> str:
+        """Update existing Lambda function."""
+        self.logger.trace(f"Updating existing function: {function_name}")
 
-        # create new role
-        role_name = generate_id(prefix='faas-lambda-role', length=8)
-        return self.resource_manager.create_aws_iam_role(
-            role_name=role_name,
-            iam_client=self._iam_client,
-            reuse_existing=True
-        )
-
-    def _build_and_push_image(self, task: Task) -> str:
-        """Build and push container image to ECR"""
-        # ensure ecr repository exists
-        repo_name = f"faas-{task.name}"
-        if self.resource_manager.aws_resources.ecr_repository_uri:
-            repo_uri = self.resource_manager.aws_resources.ecr_repository_uri
+        # Update code
+        if deployment_type == 'container':
+            self._lambda_client.update_function_code(
+                FunctionName=function_name,
+                ImageUri=package
+            )
         else:
-            repo_uri = self.resource_manager.create_aws_ecr_repository(
-                repo_name=repo_name,
-                ecr_client=self._ecr_client,
-                region=self.region,
-                reuse_existing=True
+            self._lambda_client.update_function_code(
+                FunctionName=function_name,
+                ZipFile=package
             )
 
-        # configure ecr registry
-        ecr_config = RegistryConfig(
-            type=RegistryType.ECR,
-            region=self.region
+        # Wait for update
+        waiter = self._lambda_client.get_waiter('function_updated_v2')
+        waiter.wait(FunctionName=function_name)
+
+        # Update configuration
+        config_params = {
+            k: v for k, v in params.items()
+            if k not in ['Code', 'PackageType', 'FunctionName']
+        }
+        response = self._lambda_client.update_function_configuration(
+            FunctionName=function_name,
+            **config_params
         )
-        self.registry_manager.configure_registry('ecr', ecr_config)
 
-        # build and push image
-        image_tag = f"{task.name}-{int(time.time())}"
-        return self.registry_manager.build_and_push_image(
-            source_path=task.source_path,
-            repository_uri=repo_uri,
-            image_tag=image_tag
-        )
+        # Wait for configuration update
+        waiter = self._lambda_client.get_waiter('function_updated_v2')
+        waiter.wait(FunctionName=function_name)
 
-    def _create_inline_package(self, task: Task) -> bytes:
-        """Create deployment package from inline code"""
-        import tempfile
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # write handler code
-            handler_file = Path(tmpdir) / "handler.py"
-            handler_file.write_text(task.handler_code)
+        return response['FunctionArn']
 
-            # create deployment package
-            return create_deployment_package(tmpdir)
+    def _get_environment_variables(self, task: Task) -> Dict[str, str]:
+        """Extract environment variables from Task."""
+        env_vars = {}
 
-    def _normalize_memory(self, memory: int) -> int:
-        """Normalize memory to Lambda constraints"""
-        memory = max(memory, LAMBDA_MIN_MEMORY)
-        memory = min(memory, LAMBDA_MAX_MEMORY)
-        return int(memory)
+        if task.env_var:
+            for var in task.env_var:
+                if isinstance(var, str) and '=' in var:
+                    key, value = var.split('=', 1)
+                    if not key.startswith('FAAS_'):  # Skip FaaS config
+                        env_vars[key] = value
 
-    @retry_on_error()
-    def invoke_function(self, function_name: str, payload: Any = None,
-                        invocation_type: str = 'RequestResponse') -> Dict[str, Any]:
-        """Invoke Lambda function with smart retry for Pending state"""
-        # prepare payload
-        payload_json = json.dumps(payload) if payload else '{}'
+        return env_vars
 
-        # retry configuration for pending state
-        max_attempts = 10
-        base_delay = 1  # start with 1 second
-        max_delay = 10  # cap at 10 seconds
+    def invoke_function(self, function_name: str, payload: Any = None) -> Dict[str, Any]:
+        """Invoke a Lambda function.
 
-        last_exception = None
+        Args:
+            function_name: Function name or identifier.
+            payload: JSON-serializable payload.
 
-        for attempt in range(max_attempts):
-            try:
-                # try to invoke the function
-                response = self._lambda_client.invoke(
-                    FunctionName=function_name,
-                    InvocationType=invocation_type,
-                    Payload=payload_json
-                )
+        Returns:
+            Function response.
+        """
+        self.profiler.prof('lambda_invoke_start', uid=function_name)
 
-                # parse response
-                result = {
-                    'StatusCode': response['StatusCode'],
-                    'ExecutedVersion': response.get('ExecutedVersion'),
-                    'Payload': response['Payload'].read().decode('utf-8') if 'Payload' in response else None
-                }
-
-                if result['Payload']:
-                    try:
-                        result['Payload'] = json.loads(result['Payload'])
-                    except json.JSONDecodeError:
-                        pass  # keep as string
-
-                self.logger.info(f'Invoked function {function_name} successfully')
-                return result
-
-            except ClientError as e:
-                error_code = e.response['Error']['Code']
-                error_message = e.response['Error']['Message']
-
-                # check if its a pending state error
-                if (error_code == 'ResourceConflictException' and
-                        'The function is currently in the following state: Pending' in error_message):
-
-                    if attempt < max_attempts - 1:
-                        # calculate delay with exponential backoff
-                        delay = min(base_delay * (2 ** attempt), max_delay)
-                        self.logger.info(
-                            f'Function {function_name} is pending, retrying in {delay}s... (attempt {attempt + 1}/{max_attempts})')
-                        time.sleep(delay)
-                        continue
-                    else:
-                        # max attempts reached
-                        raise InvocationException(
-                            f'Function {function_name} did not become active after {max_attempts} attempts')
+        try:
+            # Find full function name if needed
+            full_name = None
+            with self._functions_lock:
+                if function_name in self._functions:
+                    full_name = function_name
                 else:
-                    # not a pending state error so raise immediately
-                    raise InvocationException(f'Failed to invoke function {function_name}: {str(e)}')
+                    # Search by task ID or partial name
+                    for fname, fdata in self._functions.items():
+                        if (fdata['task_id'] == function_name or
+                                function_name in fname):
+                            full_name = fname
+                            break
 
-            except Exception as e:
-                # any other exception raise immediately
-                raise InvocationException(f'Unexpected error invoking function {function_name}: {str(e)}')
+            if not full_name:
+                raise InvocationException(f"Function '{function_name}' not found")
 
-        # this should never be reached but just in case
-        if last_exception:
-            raise last_exception
-        else:
-            raise InvocationException(f'Failed to invoke function {function_name} after {max_attempts} attempts')
+            # Invoke
+            response = self._lambda_client.invoke(
+                FunctionName=full_name,
+                Payload=json.dumps(payload or {}),
+                LogType='Tail'
+            )
 
-    def list_functions(self) -> List[Dict[str, Any]]:
-        """List all Lambda functions"""
-        try:
-            functions = []
-            paginator = self._lambda_client.get_paginator('list_functions')
+            # Parse response
+            response_payload = json.loads(
+                response['Payload'].read().decode('utf-8')
+            )
 
-            for page in paginator.paginate():
-                for func in page['Functions']:
-                    functions.append({
-                        'name': func['FunctionName'],
-                        'arn': func['FunctionArn'],
-                        'runtime': func.get('Runtime', 'container'),
-                        'handler': func.get('Handler', 'unknown'),
-                        'memory': func.get('MemorySize', 0),
-                        'timeout': func.get('Timeout', 0),
-                        'state': func.get('State', 'unknown'),
-                        'package_type': func.get('PackageType', 'Zip')
-                    })
+            self.profiler.prof('lambda_invoke_end', uid=function_name)
 
-            return functions
-
-        except ClientError as e:
-            self.logger.error(f'Failed to list functions: {str(e)}')
-            return []
-
-    @retry_on_error()
-    def delete_function(self, function_name: str):
-        """Delete a Lambda function"""
-        try:
-            self._lambda_client.delete_function(FunctionName=function_name)
-
-            # remove from tracking
-            with self._task_lock:
-                self._deployed_functions.pop(function_name, None)
-                for name, task in list(self._functions_book.items()):
-                    if task.name == function_name:
-                        del self._functions_book[name]
-                        break
-
-            self.logger.info(f'Deleted function: {function_name}')
-
-        except ClientError as e:
-            if e.response['Error']['Code'] != 'ResourceNotFoundException':
-                raise DeploymentException(f'Failed to delete function {function_name}: {str(e)}')
-
-    def get_tasks(self) -> List[Task]:
-        """Get all deployed tasks"""
-        with self._task_lock:
-            return list(self._functions_book.values())
-
-    def get_resource_status(self) -> Dict[str, Any]:
-        """Get status of AWS resources"""
-        try:
             return {
-                'active': self.status,
-                'functions_count': len(self._deployed_functions),
-                'active_deployments': len(self._active_deployments),
-                'has_iam_role': bool(self.resource_manager.aws_resources.iam_role_arn),
-                'has_ecr_repo': bool(self.resource_manager.aws_resources.ecr_repository_uri),
-                'region': self.region
+                'statusCode': response['StatusCode'],
+                'payload': response_payload,
+                'logs': response.get('LogResult', '')
             }
+
         except Exception as e:
-            self.logger.error(f"Failed to get resource status: {e}")
-            return {'active': False, 'error': str(e)}
+            self.profiler.prof('lambda_invoke_failed', uid=function_name)
+            raise InvocationException(f"Failed to invoke '{function_name}': {e}")
 
-    def shutdown(self):
-        """Shutdown provider and cleanup resources with graceful shutdown"""
-        if not self.status:
-            return
+    def shutdown(self) -> None:
+        """Shutdown provider and cleanup resources."""
+        self.logger.trace("Shutting down AWS Lambda provider")
+        self.profiler.prof('lambda_shutdown_start', uid=self.manager_id)
 
-        self.logger.info("Shutting down AWS Lambda provider")
-
-        # stop accepting new work
+        # Signal termination
         self._terminate.set()
 
-        # wait for active deployments to complete
-        start_time = time.time()
-        while self._active_deployments and time.time() - start_time < GRACEFUL_SHUTDOWN_TIMEOUT:
-            self.logger.info(f"Waiting for {len(self._active_deployments)} active deployments...")
-            time.sleep(1)
-
-        if self._active_deployments:
-            self.logger.warning(f"{len(self._active_deployments)} deployments still active after timeout")
-
-        # wait for worker thread
-        if self.worker_thread and self.worker_thread.is_alive():
+        # Wait for worker
+        if self.asynchronous and hasattr(self, 'worker_thread'):
             self.worker_thread.join(timeout=5)
 
-        # shutdown executor
+        # Cleanup functions if auto_terminate
+        if self.auto_terminate:
+            with self._functions_lock:
+                function_names = list(self._functions.keys())
+
+            cleanup_futures = []
+            for name in function_names:
+                future = self.executor.submit(
+                    self._delete_function,
+                    name
+                )
+                cleanup_futures.append((name, future))
+
+            for name, future in cleanup_futures:
+                try:
+                    future.result(timeout=30)
+                    self.logger.trace(f"Deleted function: {name}")
+                except Exception as e:
+                    self.logger.error(f"Failed to delete {name}: {e}")
+
+            # Cleanup AWS resources
+            self.resource_manager.cleanup_aws_resources(
+                self._iam_client,
+                self._ecr_client
+            )
+
+        # Shutdown executor
         self.executor.shutdown(wait=True)
 
-        # cleanup functions if auto_terminate
-        if self.auto_terminate:
-            self.logger.info("Auto-terminating deployed functions")
-            functions_to_delete = list(self._deployed_functions.keys())
-            for function_name in functions_to_delete:
-                try:
-                    self.delete_function(function_name)
-                except Exception as e:
-                    self.logger.error(f"Error deleting function {function_name}: {e}")
+        self.profiler.prof('lambda_shutdown_end', uid=self.manager_id)
+        self.logger.trace("AWS Lambda provider shutdown complete")
 
-            # cleanup iam role if created
-            if self.resource_manager.aws_resources.iam_role_name:
-                try:
-                    self._cleanup_iam_role()
-                except Exception as e:
-                    self.logger.error(f"Failed to cleanup IAM role: {e}")
-
-            # cleanup ecr repository if created
-            if self.resource_manager.aws_resources.ecr_repository_name:
-                try:
-                    self.registry_manager.delete_ecr_repository(
-                        self.resource_manager.aws_resources.ecr_repository_name
-                    )
-                except Exception as e:
-                    self.logger.error(f"Failed to cleanup ECR repository: {e}")
-
-        # save resources
+    def _delete_function(self, function_name: str) -> None:
+        """Delete a Lambda function."""
         try:
-            self.resource_manager.save_all_resources()
-        except Exception as e:
-            self.logger.error(f"Failed to save resources: {e}")
-
-        self.status = False
-        self._shutdown_complete.set()
-        self.logger.info("AWS Lambda provider shutdown complete")
-
-    def _cleanup_iam_role(self):
-        """Clean up IAM role and attached policies"""
-        role_name = self.resource_manager.aws_resources.iam_role_name
-
-        if not role_name:
-            return
-
-        try:
-            # detach policies
-            policies = [
-                'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
-                'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
-            ]
-
-            for policy_arn in policies:
-                try:
-                    self._iam_client.detach_role_policy(
-                        RoleName=role_name,
-                        PolicyArn=policy_arn
-                    )
-                except ClientError as e:
-                    if e.response['Error']['Code'] != 'NoSuchEntity':
-                        self.logger.warning(f"Error detaching policy {policy_arn}: {e}")
-
-            # delete role
-            self._iam_client.delete_role(RoleName=role_name)
-            self.logger.info(f"Deleted IAM role: {role_name}")
-
-            # clear from resource manager
-            self.resource_manager.aws_resources.iam_role_name = None
-            self.resource_manager.aws_resources.iam_role_arn = None
-
+            self._lambda_client.delete_function(FunctionName=function_name)
         except ClientError as e:
-            if e.response['Error']['Code'] != 'NoSuchEntity':
+            if e.response['Error']['Code'] != 'ResourceNotFoundException':
                 raise
-
-    @property
-    def is_active(self):
-        """Check if provider is active"""
-        return self.status

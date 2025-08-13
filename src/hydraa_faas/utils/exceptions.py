@@ -22,8 +22,8 @@ class ECRException(FaasException):
     """Exception raised during ECR operations"""
     pass
 
-class CostTrackingException(FaasException):
-    """Exception raised during cost tracking operations"""
+class IAMException(FaasException):
+    """Exception raised during IAM operations"""
     pass
 
 # Add this new class

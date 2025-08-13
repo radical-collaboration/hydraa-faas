@@ -1,19 +1,44 @@
-"""
-Handles creation and persistence of cloud resources for Lambda deployments.
+# -*- coding: utf-8 -*-
+"""Handles the lifecycle and persistence of cloud resources for FaaS deployments.
+
+This module provides a simplified, thread-safe manager for creating and
+deleting cloud resources, such as IAM roles and ECR repositories, that are
+required by FaaS providers. It persists the state of these resources to disk,
+allowing them to be reused across sessions.
+
+The resource creation logic is idempotent, using a try-except pattern to
+gracefully handle cases where resources already exist, which makes it both
+efficient and robust.
+
+Example:
+    To create and manage AWS resources::
+
+        # (Assuming boto3 clients are created)
+        res_manager = ResourceManager()
+        res_manager.create_aws_iam_role(
+            role_name='my-faas-lambda-role',
+            iam_client=iam_client
+        )
+        res_manager.save_all_resources()
+
 """
 
-import os
 import json
+import os
+import threading
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, Any, Optional
-from dataclasses import dataclass, asdict
+from typing import Any, Dict, Optional
+
 from botocore.exceptions import ClientError
+
+from .exceptions import ECRException, IAMException
 
 
 @dataclass
 class AWSResources:
-    """AWS resource identifiers"""
+    """A data class to hold identifiers for AWS resources."""
     iam_role_arn: Optional[str] = None
     iam_role_name: Optional[str] = None
     ecr_repository_uri: Optional[str] = None
@@ -24,322 +49,288 @@ class AWSResources:
 
 @dataclass
 class LocalResources:
-    """Local deployment resource identifiers"""
+    """A data class to hold identifiers for local resources."""
     registry_url: Optional[str] = None
     config_path: Optional[str] = None
     created_at: Optional[str] = None
 
 
 class ResourceManager:
-    """
-    Manages cloud resources for FaaS deployments with persistence.
+    """Manages the lifecycle of cloud resources with persistence.
 
-    Simplified version focusing on essential resource management:
-    - AWS IAM roles and ECR repositories
-    - Local resources for development
-    - Simple JSON persistence
-    - Basic retry logic
-    - Integrated registry manager
+    This class is responsible for creating, deleting, and persisting the state
+    of cloud resources needed for FaaS deployments. It is designed to be
+    thread-safe.
+
+    Attributes:
+        aws_resources: A dataclass instance holding AWS resource information.
+        local_resources: A dataclass instance holding local resource info.
     """
 
-    def __init__(self, config_dir: Optional[str] = None):
-        """
-        Initialize ResourceManager
+    def __init__(self, config_dir: Optional[str] = None, logger: Optional[Any] = None):
+        """Initializes the ResourceManager.
 
         Args:
-            config_dir: Directory to store resource configs (default: ~/.faas)
+            config_dir: The directory to store resource configuration files.
+                        Defaults to `~/.faas`.
+            logger: An optional logger instance for logging messages.
         """
         self.config_dir = Path(config_dir or os.path.expanduser("~/.faas"))
         self.config_dir.mkdir(exist_ok=True)
+        self.logger = logger
 
-        # Resource files
         self.aws_resources_file = self.config_dir / "aws_resources.json"
         self.local_resources_file = self.config_dir / "local_resources.json"
 
-        # Resource containers
         self.aws_resources = AWSResources()
         self.local_resources = LocalResources()
 
-        # Registry manager integration
-        self._registry_manager = None
+        self._aws_lock = threading.RLock()
+        self._local_lock = threading.RLock()
 
-        # Load existing resources
         self.load_all_resources()
 
-    @property
-    def registry_manager(self):
-        """Get or create registry manager instance"""
-        if self._registry_manager is None:
-            from ..registry import RegistryManager
-            self._registry_manager = RegistryManager(logger=None)
-        return self._registry_manager
+    def _log_info(self, message: str) -> None:
+        """Logs an info message."""
+        if self.logger:
+            self.logger.info(message)
+        else:
+            print(f"[ResourceManager] {message}")
 
-    @registry_manager.setter
-    def registry_manager(self, value):
-        """Set registry manager instance"""
-        self._registry_manager = value
+    def _log_error(self, message: str) -> None:
+        """Logs an error message."""
+        if self.logger:
+            self.logger.error(message)
+        else:
+            print(f"[ResourceManager ERROR] {message}")
 
-
-    def setup_aws_resources(self,
-                           iam_client: Any,
-                           ecr_client: Any,
-                           region: str,
-                           role_name: str,
-                           repo_name: str,
-                           reuse_existing: bool = True) -> AWSResources:
-        """
-        Setup all AWS resources needed for Lambda deployments
+    def _save_resources(self, file_path: Path, data: Any) -> None:
+        """Atomically saves a resource's state to a JSON file.
 
         Args:
-            iam_client: Boto3 IAM client
-            ecr_client: Boto3 ECR client
-            region: AWS region
-            role_name: Name for IAM role
-            repo_name: Name for ECR repository
-            reuse_existing: Reuse existing resources if found
-
-        Returns:
-            AWSResources object with all identifiers
+            file_path: The path to the file where the data will be saved.
+            data: The dataclass instance to save.
         """
-        # Create IAM role
-        role_arn = self.create_aws_iam_role(role_name, iam_client, reuse_existing)
+        temp_file = file_path.with_suffix('.tmp')
+        with open(temp_file, 'w') as f:
+            json.dump(asdict(data), f, indent=2)
+        temp_file.replace(file_path)
 
-        # Create ECR repository
-        repo_uri = self.create_aws_ecr_repository(repo_name, ecr_client, region, reuse_existing)
-
-        # Update resources
-        self.aws_resources.iam_role_arn = role_arn
-        self.aws_resources.iam_role_name = role_name
-        self.aws_resources.ecr_repository_uri = repo_uri
-        self.aws_resources.ecr_repository_name = repo_name
-        self.aws_resources.region = region
-        self.aws_resources.created_at = time.strftime('%Y-%m-%d %H:%M:%S')
-
-        # Save to disk
-        self.save_aws_resources()
-
-        return self.aws_resources
-
-    def create_aws_iam_role(self,
-                           role_name: str,
-                           iam_client: Any,
-                           reuse_existing: bool = True) -> str:
-        """
-        Create or get IAM role for Lambda execution
+    def _load_resources(self, file_path: Path, data_class: Any) -> Any:
+        """Loads a resource's state from a JSON file.
 
         Args:
-            role_name: Name for the IAM role
-            iam_client: Boto3 IAM client
-            reuse_existing: If True, reuse existing role
+            file_path: The path to the file to load.
+            data_class: The dataclass type to instantiate.
 
         Returns:
-            IAM role ARN
+            An instance of the provided dataclass with the loaded data.
         """
-        # Check saved role first
-        if reuse_existing and self.aws_resources.iam_role_arn:
+        if file_path.exists():
             try:
-                iam_client.get_role(RoleName=self.aws_resources.iam_role_name)
-                return self.aws_resources.iam_role_arn
-            except ClientError:
-                pass
+                with open(file_path, 'r') as f:
+                    data = json.load(f)
+                return data_class(**data)
+            except (json.JSONDecodeError, TypeError) as e:
+                self._log_error(f"Failed to load resources from {file_path}: {e}")
+        return data_class()
 
-        # Check if role exists
-        try:
-            response = iam_client.get_role(RoleName=role_name)
-            role_arn = response['Role']['Arn']
+    def create_aws_iam_role(self, role_name: str, iam_client: Any) -> str:
+        """Creates or gets an IAM role for AWS Lambda execution.
 
-            # Ensure policies are attached
-            self._attach_lambda_policies(iam_client, role_name)
+        This method attempts to create the role and gracefully handles the
+        case where it already exists, making it idempotent.
 
+        Args:
+            role_name: The name for the IAM role.
+            iam_client: An initialized boto3 IAM client.
+
+        Returns:
+            The ARN of the IAM role.
+
+        Raises:
+            IAMException: If role creation fails for reasons other than
+                          the role already existing.
+        """
+        with self._aws_lock:
+            trust_policy = {
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"Service": "lambda.amazonaws.com"},
+                    "Action": "sts:AssumeRole"
+                }]
+            }
+            try:
+                response = iam_client.create_role(
+                    RoleName=role_name,
+                    AssumeRolePolicyDocument=json.dumps(trust_policy),
+                    Description='Execution role for FaaS Lambda functions'
+                )
+                role_arn = response['Role']['Arn']
+                self._log_info(f"Created new IAM role: {role_name}")
+                # Wait for IAM propagation
+                time.sleep(10)
+            except ClientError as e:
+                if e.response['Error']['Code'] == 'EntityAlreadyExists':
+                    self._log_info(f"Using existing IAM role: {role_name}")
+                    response = iam_client.get_role(RoleName=role_name)
+                    role_arn = response['Role']['Arn']
+                else:
+                    raise IAMException(f"Failed to create IAM role: {e}")
+
+            # Attach required policies
+            policies = [
+                'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
+                'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+            ]
+            for policy_arn in policies:
+                try:
+                    iam_client.attach_role_policy(RoleName=role_name, PolicyArn=policy_arn)
+                except ClientError as e:
+                    if e.response['Error']['Code'] != 'EntityAlreadyExists':
+                        self._log_error(f"Failed to attach policy {policy_arn}: {e}")
+
+            self.aws_resources.iam_role_arn = role_arn
+            self.aws_resources.iam_role_name = role_name
             return role_arn
 
-        except ClientError as e:
-            if e.response['Error']['Code'] != 'NoSuchEntity':
-                raise
+    def create_aws_ecr_repository(self, repo_name: str, ecr_client: Any) -> str:
+        """Creates or gets an ECR repository.
 
-        # Create new role
-        trust_policy = {
-            "Version": "2012-10-17",
-            "Statement": [{
-                "Effect": "Allow",
-                "Principal": {"Service": "lambda.amazonaws.com"},
-                "Action": "sts:AssumeRole"
-            }]
-        }
+        Args:
+            repo_name: The name for the ECR repository.
+            ecr_client: An initialized boto3 ECR client.
 
-        response = iam_client.create_role(
-            RoleName=role_name,
-            AssumeRolePolicyDocument=json.dumps(trust_policy),
-            Description='Execution role for FaaS Lambda functions'
-        )
+        Returns:
+            The URI of the ECR repository.
 
-        role_arn = response['Role']['Arn']
-
-        # Attach policies
-        self._attach_lambda_policies(iam_client, role_name)
-
-        # Wait for propagation
-        time.sleep(5)
-
-        return role_arn
-
-    def _attach_lambda_policies(self, iam_client: Any, role_name: str):
-        """Attach necessary policies to Lambda execution role"""
-        policies = [
-            'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
-            'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
-        ]
-
-        for policy_arn in policies:
+        Raises:
+            ECRException: If repository creation fails for reasons other than
+                          the repository already existing.
+        """
+        with self._aws_lock:
             try:
-                iam_client.attach_role_policy(
-                    RoleName=role_name,
-                    PolicyArn=policy_arn
+                response = ecr_client.create_repository(
+                    repositoryName=repo_name,
+                    imageTagMutability='MUTABLE'
                 )
+                repo_uri = response['repository']['repositoryUri']
+                self._log_info(f"Created ECR repository: {repo_name}")
             except ClientError as e:
-                if e.response['Error']['Code'] != 'EntityAlreadyExists':
-                    raise
+                if e.response['Error']['Code'] == 'RepositoryAlreadyExistsException':
+                    self._log_info(f"Using existing ECR repository: {repo_name}")
+                    response = ecr_client.describe_repositories(repositoryNames=[repo_name])
+                    repo_uri = response['repositories'][0]['repositoryUri']
+                else:
+                    raise ECRException(f"Failed to create ECR repository: {e}")
 
-    def create_aws_ecr_repository(self,
-                                 repo_name: str,
-                                 ecr_client: Any,
-                                 region: str,
-                                 reuse_existing: bool = True) -> str:
-        """
-        Create or get ECR repository
+            self.aws_resources.ecr_repository_uri = repo_uri
+            self.aws_resources.ecr_repository_name = repo_name
+            return repo_uri
 
-        Args:
-            repo_name: Name for the ECR repository
-            ecr_client: Boto3 ECR client
-            region: AWS region
-            reuse_existing: If True, reuse existing repository
-
-        Returns:
-            ECR repository URI
-        """
-        # Check saved repository first
-        if reuse_existing and self.aws_resources.ecr_repository_uri:
-            try:
-                ecr_client.describe_repositories(
-                    repositoryNames=[self.aws_resources.ecr_repository_name]
-                )
-                return self.aws_resources.ecr_repository_uri
-            except ClientError:
-                pass
-
-        # Try to create repository
-        try:
-            response = ecr_client.create_repository(
-                repositoryName=repo_name,
-                imageTagMutability='MUTABLE',
-                imageScanningConfiguration={'scanOnPush': True}
-            )
-            return response['repository']['repositoryUri']
-
-        except ClientError as e:
-            if e.response['Error']['Code'] == 'RepositoryAlreadyExistsException':
-                # Get existing repository URI
-                response = ecr_client.describe_repositories(
-                    repositoryNames=[repo_name]
-                )
-                return response['repositories'][0]['repositoryUri']
-            else:
-                raise
-
-
-    def setup_local_resources(self,
-                            registry_url: str = "localhost:5000",
-                            config_path: Optional[str] = None) -> LocalResources:
-        """
-        Setup local resources for development
+    def cleanup_aws_resources(self, iam_client: Any, ecr_client: Any) -> None:
+        """Cleans up all managed AWS resources with robust error handling.
 
         Args:
-            registry_url: URL of local Docker registry
-            config_path: Path to local config
-
-        Returns:
-            LocalResources object
+            iam_client: An initialized boto3 IAM client.
+            ecr_client: An initialized boto3 ECR client.
         """
-        self.local_resources.registry_url = registry_url
-        self.local_resources.config_path = config_path
-        self.local_resources.created_at = time.strftime('%Y-%m-%d %H:%M:%S')
+        with self._aws_lock:
+            # Clean up IAM role with comprehensive error handling
+            if self.aws_resources.iam_role_name:
+                role_name = self.aws_resources.iam_role_name
+                try:
+                    # First, list and detach all managed policies
+                    try:
+                        policies = iam_client.list_attached_role_policies(RoleName=role_name)
+                        for policy in policies['AttachedPolicies']:
+                            try:
+                                iam_client.detach_role_policy(
+                                    RoleName=role_name,
+                                    PolicyArn=policy['PolicyArn']
+                                )
+                                self._log_info(f"Detached policy {policy['PolicyArn']} from role {role_name}")
+                            except ClientError as e:
+                                if e.response['Error']['Code'] != 'NoSuchEntity':
+                                    self._log_error(f"Failed to detach policy: {e}")
+                    except ClientError as e:
+                        if e.response['Error']['Code'] != 'NoSuchEntity':
+                            self._log_error(f"Failed to list attached policies: {e}")
 
-        self.save_local_resources()
-        return self.local_resources
+                    # Also check for inline policies
+                    try:
+                        inline_policies = iam_client.list_role_policies(RoleName=role_name)
+                        for policy_name in inline_policies.get('PolicyNames', []):
+                            try:
+                                iam_client.delete_role_policy(
+                                    RoleName=role_name,
+                                    PolicyName=policy_name
+                                )
+                                self._log_info(f"Deleted inline policy {policy_name} from role {role_name}")
+                            except ClientError as e:
+                                if e.response['Error']['Code'] != 'NoSuchEntity':
+                                    self._log_error(f"Failed to delete inline policy: {e}")
+                    except ClientError as e:
+                        if e.response['Error']['Code'] != 'NoSuchEntity':
+                            self._log_error(f"Failed to list inline policies: {e}")
 
+                    # Check for instance profiles using this role
+                    try:
+                        instance_profiles = iam_client.list_instance_profiles_for_role(RoleName=role_name)
+                        for profile in instance_profiles.get('InstanceProfiles', []):
+                            try:
+                                iam_client.remove_role_from_instance_profile(
+                                    InstanceProfileName=profile['InstanceProfileName'],
+                                    RoleName=role_name
+                                )
+                                self._log_info(f"Removed role from instance profile {profile['InstanceProfileName']}")
+                            except ClientError as e:
+                                if e.response['Error']['Code'] != 'NoSuchEntity':
+                                    self._log_error(f"Failed to remove role from instance profile: {e}")
+                    except ClientError as e:
+                        if e.response['Error']['Code'] != 'NoSuchEntity':
+                            self._log_error(f"Failed to list instance profiles: {e}")
 
-    def save_aws_resources(self):
-        """Save AWS resources to file"""
-        with open(self.aws_resources_file, 'w') as f:
-            json.dump(asdict(self.aws_resources), f, indent=2)
+                    # Now delete the role
+                    iam_client.delete_role(RoleName=role_name)
+                    self._log_info(f"Deleted IAM role: {role_name}")
 
-    def save_local_resources(self):
-        """Save local resources to file"""
-        with open(self.local_resources_file, 'w') as f:
-            json.dump(asdict(self.local_resources), f, indent=2)
+                except ClientError as e:
+                    if e.response['Error']['Code'] != 'NoSuchEntity':
+                        self._log_error(f"Failed to delete IAM role {role_name}: {e}")
 
-    def load_aws_resources(self) -> bool:
-        """Load AWS resources from file"""
-        if self.aws_resources_file.exists():
-            try:
-                with open(self.aws_resources_file, 'r') as f:
-                    data = json.load(f)
-                self.aws_resources = AWSResources(**data)
-                return True
-            except Exception:
-                self.aws_resources = AWSResources()
-        return False
+            # Clean up ECR repository
+            if self.aws_resources.ecr_repository_name:
+                repo_name = self.aws_resources.ecr_repository_name
+                try:
+                    ecr_client.delete_repository(repositoryName=repo_name, force=True)
+                    self._log_info(f"Deleted ECR repository: {repo_name}")
+                except ClientError as e:
+                    if e.response['Error']['Code'] != 'RepositoryNotFoundException':
+                        self._log_error(f"Failed to delete ECR repo {repo_name}: {e}")
 
-    def load_local_resources(self) -> bool:
-        """Load local resources from file"""
-        if self.local_resources_file.exists():
-            try:
-                with open(self.local_resources_file, 'r') as f:
-                    data = json.load(f)
-                self.local_resources = LocalResources(**data)
-                return True
-            except Exception:
-                self.local_resources = LocalResources()
-        return False
+            self.clear_aws_resources()
 
-    def load_all_resources(self):
-        """Load all saved resources"""
-        self.load_aws_resources()
-        self.load_local_resources()
+    def load_all_resources(self) -> None:
+        """Loads all resource configurations from disk."""
+        with self._aws_lock:
+            self.aws_resources = self._load_resources(self.aws_resources_file, AWSResources)
+        with self._local_lock:
+            self.local_resources = self._load_resources(self.local_resources_file, LocalResources)
 
-    def save_all_resources(self):
-        """Save all resources"""
-        if self.aws_resources.iam_role_arn or self.aws_resources.ecr_repository_uri:
-            self.save_aws_resources()
-        if self.local_resources.registry_url:
-            self.save_local_resources()
+    def save_all_resources(self) -> None:
+        """Saves all current resource configurations to disk."""
+        with self._aws_lock:
+            if self.aws_resources.iam_role_arn or self.aws_resources.ecr_repository_uri:
+                self._save_resources(self.aws_resources_file, self.aws_resources)
+        with self._local_lock:
+            if self.local_resources.registry_url:
+                self._save_resources(self.local_resources_file, self.local_resources)
 
-    def clear_aws_resources(self):
-        """Clear AWS resources"""
-        self.aws_resources = AWSResources()
-        if self.aws_resources_file.exists():
-            self.aws_resources_file.unlink()
-
-    def clear_local_resources(self):
-        """Clear local resources"""
-        self.local_resources = LocalResources()
-        if self.local_resources_file.exists():
-            self.local_resources_file.unlink()
-
-    def get_status(self) -> Dict[str, Any]:
-        """Get status of all saved resources"""
-        return {
-            "config_directory": str(self.config_dir),
-            "aws": {
-                "loaded": bool(self.aws_resources.iam_role_arn),
-                "iam_role": self.aws_resources.iam_role_name,
-                "ecr_repository": self.aws_resources.ecr_repository_name,
-                "region": self.aws_resources.region,
-                "created_at": self.aws_resources.created_at
-            },
-            "local": {
-                "loaded": bool(self.local_resources.registry_url),
-                "registry_url": self.local_resources.registry_url,
-                "created_at": self.local_resources.created_at
-            }
-        }
+    def clear_aws_resources(self) -> None:
+        """Clears the AWS resource state and deletes the config file."""
+        with self._aws_lock:
+            self.aws_resources = AWSResources()
+            if self.aws_resources_file.exists():
+                self.aws_resources_file.unlink()
