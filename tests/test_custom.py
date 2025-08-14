@@ -1,640 +1,341 @@
-"""
-unit tests for nuclio provider
-tests kubernetes and nuclio functionality without real clusters
-"""
+"""Unit tests for NuclioProvider (custom_faas)."""
+
 import unittest
-import queue
-import time
-import json
-import threading
 from unittest.mock import Mock, MagicMock, patch, call
-from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timedelta
+import json
+import os
+import tempfile
+import shutil
+import threading
+import asyncio
 
-# import the actual VM classes from the hydraa library
-from hydraa import LocalVM, AwsVM
-
-# mock classes that properly inherit from hydraa classes
-class MockLocalVM(LocalVM):
-    def __init__(self):
-        # LocalVM expects launch_type as positional parameter (lowercase)
-        super().__init__('create')
-        self.Provider = 'local'
-        self.VmName = 'local-vm'
-        self.Servers = []
-        self.KubeConfigPath = None
-
-
-class MockAwsVM(AwsVM):
-    def __init__(self):
-        # AwsVM expects positional parameters
-        super().__init__(
-            'EKS',  # launch_type
-            'ami-12345678',  # image_id
-            1,  # min_count
-            1,  # max_count
-            't2.micro'  # instance_type
-        )
-        self.Provider = 'aws'
-        self.VmName = 'aws-vm'
-
-
-# mock classes
-class MockTask(Future):
-    def __init__(self):
-        super().__init__()
-        self.name = 'test-task'
-        self.image = None
-        self.source_path = None
-        self.handler_code = None
-        self.vcpus = 1
-        self.memory = 512
-        self.runtime = 'python:3.9'
-        self.handler = 'main:handler'
-        self.env_vars = {}
-        self.schedule = None
-        self.provider = 'nuclio'
-        self.launch_type = 'nuclio'
-        self.id = None
-        self.state = None
-        self.arn = None
-        self.cmd = []
-        self.labels = {}
-        self.min_replicas = 0
-        self.max_replicas = 10
-
-    def set_running_or_notify_cancel(self):
-        pass
-
-
-class MockRemote:
-    def __init__(self):
-        pass
+from hydraa import Task
+from hydraa_faas.faas_manager.custom_faas import NuclioProvider, DeploymentException, NuclioException
 
 
 class TestNuclioProvider(unittest.TestCase):
-    """test cases for nuclio provider"""
+    """Test cases for NuclioProvider."""
 
     def setUp(self):
-        """set up test fixtures"""
+        """Set up test fixtures."""
+        # Create temporary directory
+        self.test_dir = tempfile.mkdtemp()
+
+        # Mock VMs
+        self.mock_vm = Mock()
+        self.mock_vm.Provider = 'local'
+        self.vms = [self.mock_vm]
+
+        # Mock credentials
+        self.cred = {'username': 'test', 'password': 'test'}
+
+        # Mock logger and profiler
         self.mock_logger = Mock()
-        self.mock_resource_manager = Mock()
-        self.mock_resource_manager.registry_manager = Mock()
-
-        self.local_vm = MockLocalVM()
-        self.aws_vm = MockAwsVM()
-
-        self.mock_creds = {
-            'registry_type': 'dockerhub',
-            'registry_url': 'docker.io/testuser',
-            'registry_username': 'testuser',
-            'registry_password': 'testpass',
-            'nuclio_version': '1.13.0',
-            'namespace': 'nuclio-test'
-        }
-
-    @patch('hydraa_faas.faas_manager.custom_faas.NuclioProvider._initialize_resources')
-    def test_initialization(self, mock_init_resources):
-        """test provider initializes correctly"""
-        from hydraa_faas.faas_manager.custom_faas import NuclioProvider, DeploymentTarget
-
-        # create provider
-        provider = NuclioProvider(
-            sandbox='test_sandbox',
-            manager_id='test_id',
-            vms=[self.local_vm],
-            cred=self.mock_creds,
-            asynchronous=True,
-            auto_terminate=False,
-            log=self.mock_logger,
-            resource_manager=self.mock_resource_manager
-        )
-
-        # verify initialization
-        self.assertEqual(provider.deployment_target, DeploymentTarget.MINIKUBE)
-        self.assertEqual(provider.nuclio_config.namespace, 'nuclio-test')
-        self.assertIsNotNone(provider.connection_pool)
-        self.assertIsNotNone(provider.batch_processor)
-        self.assertEqual(provider._task_id, 0)
-        self.assertTrue(provider.worker_thread.is_alive())
-
-        # verify background init thread was created (may have finished already)
-        self.assertIsNotNone(provider._init_thread)
-
-        # cleanup
-        provider._terminate.set()
-        provider.worker_thread.join(timeout=2)
-
-    def test_deployment_target_detection(self):
-        """test correct deployment target is detected from vm types"""
-        from hydraa_faas.faas_manager.custom_faas import NuclioProvider, DeploymentTarget
-
-        # patch initialization to prevent real setup
-        with patch('hydraa_faas.faas_manager.custom_faas.NuclioProvider._initialize_resources'):
-            # test local vm -> minikube
-            provider_local = NuclioProvider(
-                sandbox='test',
-                manager_id='test',
-                vms=[self.local_vm],
-                cred=self.mock_creds,
-                asynchronous=True,
-                auto_terminate=False,
-                log=self.mock_logger,
-                resource_manager=self.mock_resource_manager  # use the mock resource manager
-            )
-            self.assertEqual(provider_local.deployment_target, DeploymentTarget.MINIKUBE)
-            provider_local._terminate.set()
-
-            # test aws vm -> eks
-            provider_aws = NuclioProvider(
-                sandbox='test',
-                manager_id='test',
-                vms=[self.aws_vm],
-                cred=self.mock_creds,
-                asynchronous=True,
-                auto_terminate=False,
-                log=self.mock_logger,
-                resource_manager=self.mock_resource_manager  # use the mock resource manager
-            )
-            self.assertEqual(provider_aws.deployment_target, DeploymentTarget.EKS)
-            provider_aws._terminate.set()
-
-    def test_function_config_from_task(self):
-        """test function config creation from task"""
-        from hydraa_faas.faas_manager.custom_faas import FunctionConfig
-
-        # create task with various properties
-        task = MockTask()
-        task.vcpus = 2
-        task.memory = 1024
-        task.env_vars = {'KEY1': 'value1', 'KEY2': 'value2'}
-        task.labels = {'app': 'test', 'version': '1.0'}
-        task.min_replicas = 1
-        task.max_replicas = 5
-        task.cmd = ['pip install requests', 'pip install numpy']
-
-        # create config
-        config = FunctionConfig.from_task(task, namespace='test-ns')
-
-        # verify config
-        self.assertEqual(config.name, 'test-task')
-        self.assertEqual(config.namespace, 'test-ns')
-        self.assertEqual(config.runtime, 'python:3.9')
-        self.assertEqual(config.handler, 'main:handler')
-        self.assertEqual(config.env_vars, task.env_vars)
-        self.assertEqual(config.labels, task.labels)
-        self.assertEqual(config.min_replicas, 1)
-        self.assertEqual(config.max_replicas, 5)
-        self.assertEqual(config.build_commands, ['pip install requests', 'pip install numpy'])
-
-        # verify resources calculation
-        self.assertEqual(config.resources['requests']['cpu'], '2000m')
-        self.assertEqual(config.resources['requests']['memory'], '1024Mi')
-        self.assertEqual(config.resources['limits']['cpu'], '4000m')  # 2x vcpus
-        self.assertEqual(config.resources['limits']['memory'], '2048Mi')  # 2x memory
-
-    def test_connection_pooling(self):
-        """test connection pool manages ssh and http clients efficiently"""
-        # patch httpx.Client to avoid http2 issues
-        with patch('httpx.Client') as mock_client_class:
-            # create mock clients
-            mock_client1 = Mock()
-            mock_client1.is_closed = False
-            mock_client2 = Mock()
-            mock_client2.is_closed = False
-
-            # return different mock clients for different base_urls
-            def client_side_effect(base_url=None, **kwargs):
-                if base_url == 'http://test.com':
-                    return mock_client1
-                else:
-                    return mock_client2
-
-            mock_client_class.side_effect = client_side_effect
-
-            from hydraa_faas.faas_manager.custom_faas import ConnectionPool
-
-            pool = ConnectionPool(self.mock_logger)
-
-            # test http client pooling
-            client1 = pool.get_http_client('http://test.com')
-            client2 = pool.get_http_client('http://test.com')
-            client3 = pool.get_http_client('http://other.com')
-
-            # same url should return same client
-            self.assertIs(client1, client2)
-            # different url gets different client
-            self.assertIsNot(client1, client3)
-
-            # verify pool tracking
-            self.assertEqual(len(pool._http_clients), 2)
-
-            # cleanup
-            pool.close_all()
-
-    @patch('paramiko.SSHClient')
-    def test_ssh_connection_reuse(self, mock_ssh_class):
-        """test ssh connections are reused within timeout window"""
-        from hydraa_faas.faas_manager.custom_faas import ConnectionPool
-
-        pool = ConnectionPool(self.mock_logger)
-
-        # mock ssh client
-        mock_ssh = Mock()
-        mock_transport = Mock()
-        mock_transport.is_active.return_value = True
-        mock_ssh.get_transport.return_value = mock_transport
-        mock_ssh_class.return_value = mock_ssh
-
-        # test with current time for first two connections
-        with patch('time.time', return_value=10):
-            client1 = pool.get_ssh_client('192.168.1.100', username='docker')
-            client2 = pool.get_ssh_client('192.168.1.100', username='docker')
-
-            # should reuse same connection
-            self.assertEqual(mock_ssh.connect.call_count, 1)
-
-        # now test with time past the reuse timeout
-        with patch('time.time', return_value=350):
-            client3 = pool.get_ssh_client('192.168.1.100', username='docker')
-            # should create new connection
-            self.assertEqual(mock_ssh.connect.call_count, 2)
-
-        # cleanup
-        pool.close_all()
-
-    def test_batch_processor(self):
-        """test batch processor handles parallel deployments"""
-        from hydraa_faas.faas_manager.custom_faas import BatchProcessor, FunctionConfig
-
-        executor = ThreadPoolExecutor(max_workers=3)
-        processor = BatchProcessor(executor, self.mock_logger)
-
-        # create configs
-        configs = []
-        for i in range(5):
-            config = FunctionConfig(
-                name=f'func-{i}',
-                namespace='test',
-                runtime='python:3.9',
-                handler='handler:main'
-            )
-            configs.append(config)
-
-        # mock deploy function
-        deploy_results = {}
-        def mock_deploy(config):
-            if config.name == 'func-2':
-                raise Exception("Deploy failed")
-            return {'status': 'deployed', 'name': config.name}
-
-        # process batch
-        results = processor.deploy_batch(configs, mock_deploy)
-
-        # verify results
-        self.assertEqual(len(results), 5)
-        self.assertEqual(results['func-0']['status'], 'success')
-        self.assertEqual(results['func-2']['status'], 'error')
-        self.assertIn('Deploy failed', results['func-2']['error'])
-
-        # cleanup
-        executor.shutdown(wait=False)
-
-    def test_task_processing_with_source_code(self):
-        """test processing task with inline source code"""
-        provider = self._create_provider_with_mocks()
-
-        # create task with handler code
-        task = MockTask()
-        task.handler_code = """
-def handler(context, event):
-    return "Hello from Nuclio"
-"""
-
-        # manually assign task id and name as the worker would
-        with provider._task_lock:
-            task.id = provider._task_id
-            task.name = f'nuclio-function-{provider._task_id}'
-            provider._task_id += 1
-            provider._functions_book[task.name] = task
-            provider._active_deployments.add(task.name)
-
-        # mock deployment methods
-        provider._deploy_local = Mock(return_value={'status': 'ready'})
-        provider._cache_function_endpoint = Mock()
-        provider._get_function_url = Mock(return_value='http://test-url')
-
-        # mock task future methods
-        task.done = Mock(return_value=False)
-        task.set_running_or_notify_cancel = Mock()
-        task.set_result = Mock()
-
-        # call the bulk processing method which handles tasks
-        from hydraa_faas.faas_manager.custom_faas import FunctionConfig
-        config = FunctionConfig.from_task(task, provider.nuclio_config.namespace)
-
-        # deploy directly
-        result = provider._deploy_local(config)
-
-        # verify deployment
-        self.assertEqual(result, {'status': 'ready'})
-        provider._deploy_local.assert_called_once()
-
-    def test_yaml_generation_with_custom_commands(self):
-        """test nuclio yaml generation includes custom build commands"""
-        from hydraa_faas.faas_manager.custom_faas import FunctionConfig
-
-        provider = self._create_provider_with_mocks()
-
-        # create config with custom commands
-        config = FunctionConfig(
-            name='test-func',
-            namespace='nuclio',
-            runtime='python:3.9',
-            handler='main:handler',
-            source_path='/test/path',
-            build_commands=['pip install pandas', 'pip install scikit-learn']
-        )
-
-        # generate yaml
-        yaml_content = provider._generate_nuclio_yaml(config)
-
-        # verify yaml structure
-        self.assertEqual(yaml_content['metadata']['name'], 'test-func')
-        self.assertEqual(yaml_content['spec']['runtime'], 'python:3.9')
-
-        # verify build commands
-        build_commands = yaml_content['spec']['build']['commands']
-        self.assertIn('pip install msgpack', build_commands)  # default
-        self.assertIn('pip install pandas', build_commands)
-        self.assertIn('pip install scikit-learn', build_commands)
-
-    @patch('hydraa_faas.faas_manager.custom_faas.sh_callout')
-    def test_minikube_ssh_invocation(self, mock_sh):
-        """test function invocation via ssh for minikube"""
-        from hydraa_faas.faas_manager.custom_faas import DeploymentTarget
-
-        provider = self._create_provider_with_mocks()
-        provider.deployment_target = DeploymentTarget.MINIKUBE
-
-        # setup cached endpoint
-        provider._endpoint_cache['test-func'] = {
-            'type': 'nodeport',
-            'host': '192.168.49.2',
-            'port': '31000',
-            'cached_at': time.time()
-        }
-
-        # mock ssh client
-        mock_ssh = Mock()
-        mock_stdout = Mock()
-        mock_stdout.read.return_value = b'{"result": "success"}'
-        mock_stderr = Mock()
-        mock_stderr.read.return_value = b''
-        mock_ssh.exec_command.return_value = (None, mock_stdout, mock_stderr)
-
-        provider.connection_pool.get_ssh_client = Mock(return_value=mock_ssh)
-
-        # invoke function
-        result = provider.invoke_function('test-func', {'input': 'data'})
-
-        # verify ssh command
-        mock_ssh.exec_command.assert_called_once()
-        ssh_cmd = mock_ssh.exec_command.call_args[0][0]
-        self.assertIn('curl', ssh_cmd)
-        self.assertIn('localhost:31000', ssh_cmd)
-        self.assertIn('Content-Type: application/json', ssh_cmd)
-
-        # verify result
-        self.assertEqual(result, {'result': 'success'})
-
-    def test_remote_invocation_via_gateway(self):
-        """test function invocation via gateway for remote deployments"""
-        from hydraa_faas.faas_manager.custom_faas import DeploymentTarget
-
-        provider = self._create_provider_with_mocks()
-        provider.deployment_target = DeploymentTarget.EKS
-
-        # mock nginx url
-        provider._get_nginx_url = Mock(return_value='http://nginx.example.com')
-
-        # mock http client
-        mock_response = Mock()
-        mock_response.raise_for_status = Mock()
-        mock_response.json.return_value = {'result': 'remote success'}
-
-        mock_client = Mock()
-        mock_client.post.return_value = mock_response
-        provider.connection_pool.get_http_client = Mock(return_value=mock_client)
-
-        # invoke function
-        result = provider.invoke_function('remote-func', {'data': 'test'})
-
-        # verify gateway call
-        mock_client.post.assert_called_once_with(
-            'http://nginx.example.com/api/gateway/remote-func',
-            json={'data': 'test'}
-        )
-
-        # verify result
-        self.assertEqual(result, {'result': 'remote success'})
-
-    def test_parallel_bulk_processing(self):
-        """test bulk task processing with parallel deployments"""
-        provider = self._create_provider_with_mocks()
-
-        # create multiple tasks
-        tasks = []
-        for i in range(5):
-            task = MockTask()
-            task.name = f'bulk-func-{i}'
-            task.source_path = f'/path/{i}'
-            tasks.append(task)
-
-        # mock batch processor
-        def mock_deploy_batch(configs, deploy_func):
-            results = {}
-            for config in configs:
-                results[config.name] = {
-                    'status': 'success',
-                    'result': {'name': config.name}
-                }
-            return results
-
-        provider.batch_processor.deploy_batch = mock_deploy_batch
-        provider._get_function_url = Mock(return_value='http://test')
-
-        # process bulk
-        provider._process_bulk(tasks)
-
-        # verify all tasks completed
-        for task in tasks:
-            self.assertEqual(task.state, 'DEPLOYED')
-            self.assertIsNotNone(task.result())
-
-    @patch('hydraa_faas.faas_manager.custom_faas.sh_callout')
-    def test_endpoint_caching(self, mock_sh):
-        """test function endpoints are cached for performance"""
-        provider = self._create_provider_with_mocks()
-
-        # mock kubectl output
-        mock_sh.return_value = ('31234', '', 0)
-
-        # cache endpoint
-        provider._cache_function_endpoint('cached-func')
-
-        # verify cache
-        self.assertIn('cached-func', provider._endpoint_cache)
-        endpoint = provider._endpoint_cache['cached-func']
-        self.assertEqual(endpoint['type'], 'nodeport')
-        self.assertEqual(endpoint['port'], '31234')
-
-        # test cache retrieval
-        cached = provider._get_cached_endpoint('cached-func')
-        self.assertIsNotNone(cached)
-        self.assertEqual(cached['port'], '31234')
-
-        # test cache expiry by clearing the lru_cache first
-        provider._get_cached_endpoint.cache_clear()
-        with patch('time.time', return_value=time.time() + 7200):  # 2 hours later
-            expired = provider._get_cached_endpoint('cached-func')
-            self.assertIsNone(expired)
-
-    def test_graceful_shutdown(self):
-        """test provider shuts down gracefully"""
-        provider = self._create_provider_with_mocks()
-        provider.status = True
-        provider.auto_terminate = True
-
-        # add deployed functions
-        provider._deployed_functions = {
-            'func1': {},
-            'func2': {}
-        }
-
-        # add active deployment
-        provider._active_deployments.add('func3')
-
-        # mock delete function
-        provider.delete_function = Mock()
-
-        # shutdown with mocked sleep
-        with patch('time.sleep'):
-            provider.shutdown()
-
-        # verify shutdown sequence
-        self.assertTrue(provider._terminate.is_set())
-        self.assertFalse(provider.status)
-
-        # verify functions were deleted
-        self.assertEqual(provider.delete_function.call_count, 2)
-
-        # verify connection pool closed
-        provider.connection_pool.close_all = Mock()
-
-    def test_existing_cluster_reuse(self):
-        """test provider can reuse existing k8s cluster"""
-        # mock existing cluster
-        mock_cluster = Mock()
-        mock_cluster.name = 'existing-cluster'
-
-        resource_config = {
-            'existing_cluster': mock_cluster
-        }
-
-        with patch('hydraa_faas.faas_manager.custom_faas.NuclioProvider._initialize_resources') as mock_init:
-            provider = self._create_provider_with_mocks(resource_config=resource_config)
-
-            # verify existing cluster is stored
-            self.assertEqual(provider._existing_cluster, mock_cluster)
-
-    def test_registry_configuration(self):
-        """test registry configuration parsing"""
-        from hydraa_faas.faas_manager.custom_faas import NuclioProvider, RegistryType
-
-        # test different registry configs
-        configs = [
-            {
-                'registry_type': 'dockerhub',
-                'registry_url': 'docker.io/user',
-                'registry_username': 'user',
-                'registry_password': 'pass'
-            },
-            {
-                'registry_type': 'ecr',
-                'registry_url': '123456789012.dkr.ecr.us-east-1.amazonaws.com',
-                'registry_region': 'us-east-1'
-            },
-            {
-                'registry_type': 'none'
-            }
-        ]
-
-        with patch('hydraa_faas.faas_manager.custom_faas.NuclioProvider._initialize_resources'):
-            for config in configs:
-                provider = NuclioProvider(
-                    sandbox='test',
-                    manager_id='test',
-                    vms=[self.local_vm],
-                    cred=config,
-                    asynchronous=True,
-                    auto_terminate=False,
+        self.mock_logger.trace = Mock()
+        self.mock_logger.error = Mock()
+        self.mock_logger.warning = Mock()
+
+        self.mock_profiler = Mock()
+        self.mock_profiler.prof = Mock()
+
+        # Create provider with mocked dependencies
+        with patch('hydraa_faas.faas_manager.custom_faas.kubernetes.K8sCluster'):
+            with patch.object(NuclioProvider, '_setup_nuclio'):
+                self.provider = NuclioProvider(
+                    sandbox=os.path.join(self.test_dir, 'nuclio_sandbox'),
+                    manager_id='test-456',
+                    vms=self.vms,
+                    cred=self.cred,
+                    asynchronous=False,
+                    auto_terminate=True,
                     log=self.mock_logger,
-                    resource_manager=self.mock_resource_manager  # use the mock resource manager
+                    resource_config={},
+                    profiler=self.mock_profiler
                 )
 
-                if config['registry_type'] == 'none':
-                    self.assertIsNone(provider.nuclio_config.registry_config)
-                else:
-                    self.assertIsNotNone(provider.nuclio_config.registry_config)
-                    self.assertEqual(
-                        provider.nuclio_config.registry_config.type.value,
-                        config['registry_type']
-                    )
+        # Mock Kubernetes cluster
+        self.provider.k8s_cluster = Mock()
+        self.provider.k8s_cluster.status = 'RUNNING'
 
-                provider._terminate.set()
+        # Initialize threading components
+        self.provider._terminate = threading.Event()
+        self.provider._functions_lock = threading.RLock()
 
-    def _create_provider_with_mocks(self, resource_config=None):
-        """helper to create provider with mocked components"""
-        # patch the HTTP client creation to avoid http2 issues
-        with patch('hydraa_faas.faas_manager.custom_faas.NuclioProvider._initialize_resources'), \
-             patch('hydraa_faas.faas_manager.custom_faas.ConnectionPool.get_http_client') as mock_http:
+    def tearDown(self):
+        """Clean up test fixtures."""
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
 
-            # mock http client
-            mock_client = Mock()
-            mock_http.return_value = mock_client
+    def test_initialization(self):
+        """Test NuclioProvider initialization."""
+        self.assertEqual(self.provider.manager_id, 'test-456')
+        self.assertTrue(self.provider.auto_terminate)
+        self.assertFalse(self.provider.asynchronous)
+        self.assertEqual(self.provider.dashboard_port, 8070)
 
-            from hydraa_faas.faas_manager.custom_faas import NuclioProvider
+    def test_deploy_prebuilt_image(self):
+        """Test deploying a function with prebuilt image."""
+        task = Task(
+            name='test-prebuilt',
+            vcpus=1,
+            memory=512,
+            image='docker.io/myuser/myfunction:latest',
+            env_var=['FAAS_HANDLER=main:handler']
+        )
 
-            provider = NuclioProvider(
-                sandbox='test_sandbox',
-                manager_id='test_id',
-                vms=[self.local_vm],
-                cred=self.mock_creds,
-                asynchronous=True,
-                auto_terminate=False,
-                log=self.mock_logger,
-                resource_manager=self.mock_resource_manager,
-                resource_config=resource_config or {}
+        # Mock methods
+        self.provider._extract_faas_config = Mock(return_value={
+            'handler': 'main:handler',
+            'runtime': 'python:3.9',
+            'timeout': '30'
+        })
+        self.provider._generate_function_name = Mock(return_value='nuclio-test-456-prebuilt')
+        self.provider._determine_deployment_type = Mock(return_value='prebuilt-image')
+        self.provider._prepare_image = Mock(return_value='docker.io/myuser/myfunction:latest')
+        self.provider._deploy_to_nuclio = Mock()
+
+        # Deploy function
+        function_name = self.provider.deploy_function(task)
+
+        self.assertEqual(function_name, 'nuclio-test-456-prebuilt')
+        self.provider._deploy_to_nuclio.assert_called_once()
+
+    def test_deploy_container_build(self):
+        """Test deploying a function that needs container build."""
+        task = Task(
+            name='test-build',
+            vcpus=2,
+            memory=1024,
+            image='python:3.9',
+            env_var=[
+                'FAAS_SOURCE=/tmp/source',
+                'FAAS_HANDLER=handler.main',
+                'FAAS_REGISTRY_URI=localhost:5000/nuclio'
+            ]
+        )
+
+        # Mock methods
+        self.provider._extract_faas_config = Mock(return_value={
+            'source': '/tmp/source',
+            'handler': 'handler.main',
+            'runtime': 'python:3.9',
+            'registry_uri': 'localhost:5000/nuclio'
+        })
+        self.provider._generate_function_name = Mock(return_value='nuclio-test-456-build')
+        self.provider._determine_deployment_type = Mock(return_value='container-build')
+        self.provider._configure_registry_if_needed = Mock()
+
+        self.provider.registry_manager = Mock()
+        self.provider.registry_manager.build_and_push_image.return_value = (
+            'localhost:5000/nuclio:nuclio-test-456-build', Mock(), Mock()
+        )
+        self.provider._deploy_to_nuclio = Mock()
+
+        # Deploy function
+        function_name = self.provider.deploy_function(task)
+
+        self.assertEqual(function_name, 'nuclio-test-456-build')
+        self.provider.registry_manager.build_and_push_image.assert_called_once()
+
+    def test_determine_deployment_type(self):
+        """Test deployment type determination."""
+        # Test prebuilt image
+        task1 = Task(image='docker.io/user/image:tag')
+        self.assertTrue(self.provider._is_full_image_uri('docker.io/user/image:tag'))
+        self.assertEqual(
+            self.provider._determine_deployment_type(task1, {}),
+            'prebuilt-image'
+        )
+
+        # Test container build
+        task2 = Task(image='python:3.9')
+        config2 = {'source': '/tmp/source'}
+        self.assertEqual(
+            self.provider._determine_deployment_type(task2, config2),
+            'container-build'
+        )
+
+        # Test error - no image for source
+        task3 = Task()
+        config3 = {'source': '/tmp/source'}
+        with self.assertRaises(DeploymentException):
+            self.provider._determine_deployment_type(task3, config3)
+
+    @patch('nuclio.deploy_file')
+    def test_deploy_to_nuclio(self, mock_deploy):
+        """Test deploying to Nuclio platform."""
+        task = Task(
+            name='test',
+            vcpus=2,
+            memory=1024,
+            env_var=['USER_VAR=value']
+        )
+        task._user_env_vars = ['USER_VAR=value']
+
+        # Setup
+        self.provider.dashboard_url = 'http://localhost:8070'
+
+        # Mock ConfigSpec to have the expected structure
+        with patch('nuclio.ConfigSpec') as mock_config_spec:
+            mock_spec_instance = Mock()
+            mock_spec_instance.config = {"spec": {}}
+            mock_spec_instance.set_env = Mock()
+            mock_config_spec.return_value = mock_spec_instance
+
+            # Deploy
+            self.provider._deploy_to_nuclio(
+                task=task,
+                function_name='test-function',
+                image_uri='test/image:latest',
+                faas_config={'handler': 'main:handler', 'runtime': 'python:3.9'}
             )
 
-            # manually set required attributes
-            provider.k8s_cluster = Mock()
-            provider.nuctl_path = '/test/nuctl'
-            provider.dashboard_url = 'http://localhost:8070'
-            provider.status = True
+        # Verify
+        mock_deploy.assert_called_once()
+        call_args = mock_deploy.call_args[1]
+        self.assertEqual(call_args['dashboard_url'], 'http://localhost:8070')
+        self.assertEqual(call_args['name'], 'test-function')
 
-            # mock executor
-            provider.executor = Mock()
-            provider.executor.shutdown = Mock()
+    def test_invoke_function_success(self):
+        """Test successful function invocation."""
+        # Setup
+        self.provider._functions = {
+            'test-function': {
+                'task_id': '123',
+                'original_name': 'test',
+                'deployment_type': 'prebuilt-image'
+            }
+        }
+        self.provider.dashboard_url = 'http://localhost:8070'
 
-            # stop worker thread for cleaner testing
-            provider._terminate.set()
-            if provider.worker_thread and provider.worker_thread.is_alive():
-                provider.worker_thread.join(timeout=1)
-            provider._terminate.clear()
+        # Mock nuclio module's invoke function
+        with patch('hydraa_faas.faas_manager.custom_faas.nuclio') as mock_nuclio:
+            # Mock response
+            mock_response = Mock()
+            mock_response.status_code = 200
+            mock_response.text = '{"result": "success"}'
+            mock_response.headers = {'Content-Type': 'application/json'}
+            mock_nuclio.invoke.return_value = mock_response
 
-            return provider
+            # Invoke
+            result = self.provider.invoke_function('test-function', {'input': 'data'})
+
+        self.assertEqual(result['statusCode'], 200)
+        self.assertEqual(result['payload'], '{"result": "success"}')
+        mock_nuclio.invoke.assert_called_once_with(
+            dashboard_url='http://localhost:8070',
+            name='test-function',
+            body='{"input": "data"}'
+        )
+
+    def test_create_source_from_inline_code(self):
+        """Test creating source directory from inline code."""
+        task = Task(
+            cmd=['python', '-c', 'def my_function(): return "hello"']
+        )
+        task.id = 'test-123'
+
+        # Mock file operations
+        mock_file = Mock()
+
+        with patch('builtins.open', create=True) as mock_open:
+            mock_open.return_value.__enter__.return_value = mock_file
+            with patch('os.makedirs'):
+                source_path = self.provider._create_source_from_inline_code(
+                    task, {'handler': 'main:handler'}
+                )
+
+        # Verify file was written
+        mock_open.assert_called()
+        self.assertTrue(source_path.endswith('_source'))
+
+    @patch('subprocess.Popen')
+    def test_setup_dashboard_access(self, mock_popen):
+        """Test dashboard access setup."""
+        # Mock subprocess for port forwarding
+        mock_process = Mock()
+        mock_popen.return_value = mock_process
+
+        # Mock asyncio operations more carefully
+        with patch('asyncio.new_event_loop') as mock_new_loop:
+            with patch('asyncio.set_event_loop') as mock_set_loop:
+                # Create a proper mock event loop
+                mock_loop = Mock()
+                mock_loop.run_until_complete = Mock(return_value=True)
+                mock_loop.close = Mock()
+                mock_new_loop.return_value = mock_loop
+
+                self.provider._setup_dashboard_access()
+
+        # Verify port forward was started
+        mock_popen.assert_called_once()
+        self.assertIsNotNone(self.provider._port_forward_process)
+        self.assertEqual(self.provider.dashboard_url, 'http://localhost:8070')
+
+    def test_shutdown_cleanup(self):
+        """Test provider shutdown with cleanup."""
+        # Setup functions to delete
+        self.provider._functions = {
+            'func1': {'task_id': '1'},
+            'func2': {'task_id': '2'}
+        }
+
+        # Mock worker thread
+        self.provider.worker_thread = Mock()
+        self.provider.worker_thread.is_alive.return_value = True
+        self.provider.worker_thread.join.return_value = None
+
+        # Mock port forward process
+        self.provider._port_forward_process = Mock()
+
+        # Mock k8s cluster
+        self.provider.k8s_cluster = Mock()
+
+        # Mock executor
+        self.provider.executor = Mock()
+
+        # Mock nuclio module's delete_function
+        with patch('hydraa_faas.faas_manager.custom_faas.nuclio') as mock_nuclio:
+            mock_nuclio.delete_function = Mock()
+
+            # Shutdown
+            self.provider.shutdown()
+
+            # Verify cleanup
+            self.assertTrue(self.provider._terminate.is_set())
+            self.assertEqual(mock_nuclio.delete_function.call_count, 2)
+            mock_nuclio.delete_function.assert_any_call(
+                dashboard_url=self.provider.dashboard_url,
+                name='func1'
+            )
+            mock_nuclio.delete_function.assert_any_call(
+                dashboard_url=self.provider.dashboard_url,
+                name='func2'
+            )
+
+        self.provider._port_forward_process.terminate.assert_called_once()
+        self.provider.k8s_cluster.shutdown.assert_called_once()
+        self.provider.executor.shutdown.assert_called_once_with(wait=True)
+
+    def test_extract_granular_config(self):
+        """Test extracting granular Nuclio configuration."""
+        task = Task(
+            env_var=[
+                'FAAS_MIN_REPLICAS=2',
+                'FAAS_MAX_REPLICAS=10',
+                'FAAS_TARGET_CPU=80',
+                'FAAS_SCALE_TO_ZERO=true',
+                'FAAS_TRIGGERS={"http": {"maxWorkers": 4}}'
+            ]
+        )
+
+        config = self.provider._extract_granular_config(task)
+
+        self.assertEqual(config['min_replicas'], '2')
+        self.assertEqual(config['max_replicas'], '10')
+        self.assertEqual(config['target_cpu'], '80')
+        self.assertEqual(config['scale_to_zero'], 'true')
+        self.assertEqual(config['triggers'], {'http': {'maxWorkers': 4}})
 
 
 if __name__ == '__main__':

@@ -1,448 +1,369 @@
-"""
-unit tests for aws lambda provider
-tests the core functionality without hitting real aws services
-"""
+"""Unit tests for AwsLambda provider."""
+
 import unittest
-import queue
-import time
-import json
-import threading
 from unittest.mock import Mock, MagicMock, patch, call
+import json
+import os
+import tempfile
+import shutil
+import threading
 from botocore.exceptions import ClientError
-from concurrent.futures import Future
 
-# mock task class that mimics hydraa's task
-class MockTask(Future):
-    def __init__(self):
-        super().__init__()
-        self.handler_code = None
-        self.source_path = None
-        self.image = None
-        self.build_image = False
-        self.memory = 256
-        self.vcpus = 0.25
-        self.name = 'test-task'
-        self.handler = 'handler.handler'
-        self.runtime = 'python3.9'
-        self.env_vars = {}
-        self.timeout = 30
-        self.provider = 'aws'
-        self.launch_type = 'lambda'
-        self.id = None
-        self.state = None
-        self.arn = None
-        self.layers = []
-        self.vpc_config = None
-        self.tags = {}
-        self.min_replicas = 0
-        self.max_replicas = 10
-
-    def set_running_or_notify_cancel(self):
-        """mock method for task state management"""
-        pass
+from hydraa import Task
+from hydraa_faas.faas_manager.aws_lambda import AwsLambda, DeploymentException, InvocationException
 
 
 class TestAwsLambda(unittest.TestCase):
-    """test cases for aws lambda provider"""
+    """Test cases for AwsLambda provider."""
 
     def setUp(self):
-        """set up test fixtures before each test"""
-        self.mock_creds = {
+        """Set up test fixtures."""
+        # Create temporary directory
+        self.test_dir = tempfile.mkdtemp()
+
+        # Mock AWS credentials
+        self.cred = {
             'aws_access_key_id': 'test_key',
             'aws_secret_access_key': 'test_secret',
-            'region_name': 'us-east-1',
-            'auto_setup_resources': False  # disable auto setup for tests
+            'region_name': 'us-east-1'
         }
 
+        # Mock logger and profiler
         self.mock_logger = Mock()
-        self.mock_resource_manager = Mock()
-        self.mock_resource_manager.aws_resources.iam_role_arn = 'arn:aws:iam::123456789012:role/test-role'
-        self.mock_resource_manager.aws_resources.iam_role_name = 'test-role'
-        self.mock_resource_manager.aws_resources.ecr_repository_uri = '123456789012.dkr.ecr.us-east-1.amazonaws.com/test-repo'
-        self.mock_resource_manager.aws_resources.ecr_repository_name = 'test-repo'
+        self.mock_logger.trace = Mock()
+        self.mock_logger.error = Mock()
+        self.mock_logger.warning = Mock()
 
-        # mock registry manager
-        self.mock_registry_manager = Mock()
-        self.mock_resource_manager.registry_manager = self.mock_registry_manager
+        self.mock_profiler = Mock()
+        self.mock_profiler.prof = Mock()
 
-    @patch('boto3.client')
-    def test_initialization(self, mock_boto_client):
-        """test provider initializes correctly with all components"""
-        from hydraa_faas.faas_manager.aws_lambda import AwsLambda
+        # Create provider with mocked AWS client pool
+        with patch('hydraa_faas.faas_manager.aws_lambda.AWSClientPool') as mock_pool:
+            # Mock the client pool singleton
+            mock_pool_instance = Mock()
+            mock_pool.return_value = mock_pool_instance
 
-        # setup boto3 mocks
-        mock_lambda_client = Mock()
-        mock_iam_client = Mock()
-        mock_ecr_client = Mock()
+            # Mock AWS clients
+            mock_lambda_client = Mock()
+            mock_iam_client = Mock()
+            mock_ecr_client = Mock()
 
-        def client_factory(service_name, **kwargs):
-            if service_name == 'lambda':
-                return mock_lambda_client
-            elif service_name == 'iam':
-                return mock_iam_client
-            elif service_name == 'ecr':
-                return mock_ecr_client
+            mock_pool_instance.get_client.side_effect = lambda service, *args: {
+                'lambda': mock_lambda_client,
+                'iam': mock_iam_client,
+                'ecr': mock_ecr_client
+            }[service]
 
-        mock_boto_client.side_effect = client_factory
+            # Initialize provider
+            self.provider = AwsLambda(
+                sandbox=os.path.join(self.test_dir, 'lambda_sandbox'),
+                manager_id='test-123',
+                cred=self.cred,
+                asynchronous=False,
+                auto_terminate=True,
+                log=self.mock_logger,
+                resource_config={},
+                profiler=self.mock_profiler
+            )
 
-        # create provider
-        provider = AwsLambda(
-            sandbox='test_sandbox',
-            manager_id='test_id',
-            cred=self.mock_creds,
-            asynchronous=True,
-            auto_terminate=False,
-            log=self.mock_logger,
-            resource_manager=self.mock_resource_manager
+            # Set the mocked clients
+            self.provider._lambda_client = mock_lambda_client
+            self.provider._iam_client = mock_iam_client
+            self.provider._ecr_client = mock_ecr_client
+
+        # Initialize threading components
+        self.provider._terminate = threading.Event()
+        self.provider._functions_lock = threading.RLock()
+
+        # Mock resource and registry managers
+        self.provider.resource_manager = Mock()
+        self.provider.resource_manager.aws_resources = Mock()
+        self.provider.resource_manager.aws_resources.iam_role_arn = None
+        self.provider.resource_manager.aws_resources.ecr_repository_uri = None
+
+        self.provider.registry_manager = Mock()
+
+        # Mock executor
+        self.provider.executor = Mock()
+
+    def tearDown(self):
+        """Clean up test fixtures."""
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir)
+
+    def test_initialization(self):
+        """Test AwsLambda initialization."""
+        self.assertEqual(self.provider.region, 'us-east-1')
+        self.assertEqual(self.provider.manager_id, 'test-123')
+        self.assertTrue(self.provider.auto_terminate)
+        self.assertFalse(self.provider.asynchronous)
+
+    def test_deploy_zip_function(self):
+        """Test deploying a function from zip."""
+        # Create test task
+        task = Task(
+            name='test-function',
+            vcpus=1,
+            memory=512,
+            image='python:3.9',
+            cmd=['python', '-c', 'print("hello")'],
+            env_var=[
+                'FAAS_SOURCE=/tmp/test_source',
+                'FAAS_HANDLER=handler.main',
+                'FAAS_RUNTIME=python3.9'
+            ]
         )
 
-        # verify initialization
-        self.assertEqual(provider.region, 'us-east-1')
-        self.assertTrue(provider.status)
-        self.assertEqual(provider._task_id, 0)
-        self.assertEqual(len(provider._deployed_functions), 0)
-        self.assertIsNotNone(provider.worker_thread)
-        self.assertTrue(provider.worker_thread.is_alive())
+        # Mock methods
+        self.provider._extract_faas_config = Mock(return_value={
+            'source': '/tmp/test_source',
+            'handler': 'handler.main',
+            'runtime': 'python3.9',
+            'timeout': '30'
+        })
+        self.provider._generate_function_name = Mock(return_value='hydra-test-123-function')
+        self.provider._determine_deployment_type = Mock(return_value='zip')
+        self.provider._create_package = Mock(return_value=b'fake_zip_content')
+        self.provider._deploy_to_lambda = Mock(return_value='arn:aws:lambda:us-east-1:123:function:test')
 
-        # verify clients were created with correct config
-        self.assertEqual(mock_boto_client.call_count, 3)
+        # Deploy function
+        function_name = self.provider.deploy_function(task)
 
-        # cleanup - important to stop the worker thread
-        provider._terminate.set()
-        provider.worker_thread.join(timeout=2)
+        self.assertEqual(function_name, 'hydra-test-123-function')
+        self.provider._deploy_to_lambda.assert_called_once()
 
-    def test_task_processing_zip_deployment(self):
-        """test zip deployment processing directly"""
-        from hydraa_faas.faas_manager.aws_lambda import AwsLambda, LambdaConfig
+        # Verify function was tracked
+        self.assertIn('hydra-test-123-function', self.provider._functions)
 
-        # create provider with mocked clients
-        provider = self._create_provider_with_mocks()
+    def test_deploy_container_function(self):
+        """Test deploying a function from container image."""
+        task = Task(
+            name='test-container',
+            vcpus=1,
+            memory=1024,
+            image='123456789.dkr.ecr.us-east-1.amazonaws.com/myrepo:latest',
+            env_var=['FAAS_HANDLER=handler.main']
+        )
 
-        # mock successful function creation
-        provider._lambda_client.create_function.return_value = {
-            'FunctionArn': 'arn:aws:lambda:us-east-1:123456789012:function:test-func'
+        # Mock methods
+        self.provider._extract_faas_config = Mock(return_value={
+            'handler': 'handler.main',
+            'runtime': 'python3.9',
+            'timeout': '30'
+        })
+        self.provider._generate_function_name = Mock(return_value='hydra-test-123-container')
+        self.provider._determine_deployment_type = Mock(return_value='prebuilt-image')
+        self.provider._create_package = Mock(return_value='123456789.dkr.ecr.us-east-1.amazonaws.com/myrepo:latest')
+        self.provider._deploy_to_lambda = Mock(return_value='arn:aws:lambda:us-east-1:123:function:container')
+
+        # Deploy function
+        function_name = self.provider.deploy_function(task)
+
+        self.assertEqual(function_name, 'hydra-test-123-container')
+
+    def test_determine_deployment_type(self):
+        """Test deployment type determination."""
+        # Test prebuilt image
+        task1 = Task(image='123.dkr.ecr.region.amazonaws.com/repo:tag')
+        self.assertEqual(
+            self.provider._determine_deployment_type(task1, {}),
+            'prebuilt-image'
+        )
+
+        # Test zip deployment
+        task2 = Task()
+        config2 = {'source': '/tmp/source'}
+        self.assertEqual(
+            self.provider._determine_deployment_type(task2, config2),
+            'zip'
+        )
+
+        # Test container build
+        task3 = Task(image='python:3.9')
+        config3 = {'source': '/tmp/source'}
+        self.assertEqual(
+            self.provider._determine_deployment_type(task3, config3),
+            'container-build'
+        )
+
+        # Test inline code to zip
+        task4 = Task(cmd=['python', '-c', 'print("hello")'])
+        config4 = {}
+        self.assertEqual(
+            self.provider._determine_deployment_type(task4, config4),
+            'zip'
+        )
+
+    def test_deploy_to_lambda_success(self):
+        """Test successful Lambda deployment."""
+        task = Task(name='test', vcpus=1, memory=512)
+        task._user_env_vars = []
+
+        # Mock successful response
+        self.provider._lambda_client.create_function.return_value = {
+            'FunctionArn': 'arn:aws:lambda:us-east-1:123:function:test'
         }
 
-        # create config
-        config = LambdaConfig(
-            function_name='test-func',
-            runtime='python3.9',
-            role='test-role-arn',
-            handler='handler.handler',
-            timeout=30,
-            memory_size=256,
-            environment={'Variables': {'TEST': 'value'}}
+        # Mock waiter
+        mock_waiter = Mock()
+        self.provider._lambda_client.get_waiter.return_value = mock_waiter
+
+        # Mock IAM role
+        self.provider._iam_role_arn = 'arn:aws:iam::123:role/lambda-role'
+
+        # Deploy
+        arn = self.provider._deploy_to_lambda(
+            task=task,
+            function_name='test-function',
+            package=b'zip_content',
+            deployment_type='zip',
+            faas_config={'handler': 'handler.main', 'runtime': 'python3.9', 'timeout': '30'}
         )
 
-        # test zip deployment directly
-        zip_content = b'fake-zip-content'
-        result = provider._create_or_update_function(config, zip_content=zip_content)
+        self.assertEqual(arn, 'arn:aws:lambda:us-east-1:123:function:test')
+        self.provider._lambda_client.create_function.assert_called_once()
+        mock_waiter.wait.assert_called_once_with(FunctionName='test-function')
 
-        # verify zip deployment
-        provider._lambda_client.create_function.assert_called_once()
-        call_args = provider._lambda_client.create_function.call_args[1]
-        self.assertEqual(call_args['FunctionName'], 'test-func')
-        self.assertEqual(call_args['Runtime'], 'python3.9')
-        self.assertEqual(call_args['Handler'], 'handler.handler')
-        self.assertEqual(call_args['Code']['ZipFile'], zip_content)
-        self.assertEqual(call_args['MemorySize'], 256)
-        self.assertEqual(result, 'arn:aws:lambda:us-east-1:123456789012:function:test-func')
+    def test_deploy_to_lambda_update_existing(self):
+        """Test updating existing Lambda function."""
+        task = Task(name='test', vcpus=1, memory=512)
+        task._user_env_vars = []
 
-    def test_container_deployment(self):
-        """test container-based lambda deployment"""
-        from hydraa_faas.faas_manager.aws_lambda import AwsLambda, LambdaConfig
-
-        # create provider with mocked clients
-        provider = self._create_provider_with_mocks()
-
-        # mock registry manager for container builds
-        provider.registry_manager.build_and_push_image = Mock(
-            return_value='123456789012.dkr.ecr.us-east-1.amazonaws.com/test:latest'
-        )
-
-        # mock successful function creation
-        provider._lambda_client.create_function.return_value = {
-            'FunctionArn': 'arn:aws:lambda:us-east-1:123456789012:function:container-func'
-        }
-
-        # create config for container deployment
-        config = LambdaConfig(
-            function_name='container-func',
-            runtime='',  # not used for containers
-            role='test-role-arn',
-            handler='',  # not used for containers
-            timeout=30,
-            memory_size=256
-        )
-
-        # test container deployment directly
-        image_uri = '123456789012.dkr.ecr.us-east-1.amazonaws.com/test:latest'
-        result = provider._create_or_update_function(config, image_uri=image_uri)
-
-        # verify container deployment
-        provider._lambda_client.create_function.assert_called_once()
-        call_args = provider._lambda_client.create_function.call_args[1]
-        self.assertEqual(call_args['FunctionName'], 'container-func')
-        self.assertEqual(call_args['PackageType'], 'Image')
-        self.assertEqual(call_args['Code']['ImageUri'], image_uri)
-        self.assertEqual(result, 'arn:aws:lambda:us-east-1:123456789012:function:container-func')
-
-    def test_create_or_update_function_conflict_handling(self):
-        """test function update when it already exists"""
-        from hydraa_faas.faas_manager.aws_lambda import AwsLambda, LambdaConfig
-
-        # create provider with mocked clients
-        provider = self._create_provider_with_mocks()
-
-        # simulate resource conflict (function exists)
+        # Mock create function to raise ResourceConflictException
         error_response = {'Error': {'Code': 'ResourceConflictException'}}
-        provider._lambda_client.create_function.side_effect = ClientError(
-            error_response, 'CreateFunction'
-        )
+        self.provider._lambda_client.create_function.side_effect = ClientError(error_response, 'CreateFunction')
 
-        # mock successful update
-        provider._lambda_client.update_function_code.return_value = {}
-        provider._lambda_client.update_function_configuration.return_value = {
-            'FunctionArn': 'arn:aws:lambda:us-east-1:123456789012:function:existing-func'
+        # Mock update methods
+        self.provider._lambda_client.update_function_code.return_value = {}
+        self.provider._lambda_client.update_function_configuration.return_value = {
+            'FunctionArn': 'arn:aws:lambda:us-east-1:123:function:test-updated'
         }
 
-        # create config
-        config = LambdaConfig(
-            function_name='existing-func',
-            runtime='python3.9',
-            role='test-role-arn',
-            handler='index.handler',
-            timeout=60,
-            memory_size=512,
-            environment={'Variables': {'ENV': 'test'}}
+        # Mock waiter
+        mock_waiter = Mock()
+        self.provider._lambda_client.get_waiter.return_value = mock_waiter
+
+        # Mock IAM role
+        self.provider._iam_role_arn = 'arn:aws:iam::123:role/lambda-role'
+
+        # Deploy (should update)
+        arn = self.provider._deploy_to_lambda(
+            task=task,
+            function_name='test-function',
+            package=b'zip_content',
+            deployment_type='zip',
+            faas_config={'handler': 'handler.main', 'runtime': 'python3.9', 'timeout': '30'}
         )
 
-        # test update flow
-        result = provider._create_or_update_function(config, zip_content=b'updated-code')
+        self.assertEqual(arn, 'arn:aws:lambda:us-east-1:123:function:test-updated')
+        self.provider._lambda_client.update_function_code.assert_called_once()
+        self.provider._lambda_client.update_function_configuration.assert_called_once()
 
-        # verify update was called
-        provider._lambda_client.update_function_code.assert_called_once_with(
-            FunctionName='existing-func',
-            ZipFile=b'updated-code',
-            Publish=True
-        )
-        provider._lambda_client.update_function_configuration.assert_called_once()
-        self.assertEqual(result, 'arn:aws:lambda:us-east-1:123456789012:function:existing-func')
-
-    def test_invoke_function_with_pending_retry(self):
-        """test function invocation handles pending state with retries"""
-        from hydraa_faas.faas_manager.aws_lambda import AwsLambda
-
-        provider = self._create_provider_with_mocks()
-
-        # simulate pending state then success
-        pending_error = {
-            'Error': {
-                'Code': 'ResourceConflictException',
-                'Message': 'The function is currently in the following state: Pending'
+    def test_invoke_function_success(self):
+        """Test successful function invocation."""
+        # Setup
+        self.provider._functions = {
+            'test-function': {
+                'arn': 'arn:aws:lambda:us-east-1:123:function:test',
+                'task_id': '123',
+                'deployment_type': 'zip'
             }
         }
 
-        # first two calls fail with pending, third succeeds
+        # Mock response
         mock_payload = Mock()
         mock_payload.read.return_value = b'{"result": "success"}'
 
-        provider._lambda_client.invoke.side_effect = [
-            ClientError(pending_error, 'Invoke'),
-            ClientError(pending_error, 'Invoke'),
-            {
-                'StatusCode': 200,
-                'ExecutedVersion': '$LATEST',
-                'Payload': mock_payload
-            }
-        ]
-
-        # invoke with mocked sleep to speed up test
-        with patch('time.sleep'):
-            result = provider.invoke_function('test-func', {'input': 'data'})
-
-        # verify result
-        self.assertEqual(result['StatusCode'], 200)
-        self.assertEqual(result['Payload'], {'result': 'success'})
-        self.assertEqual(provider._lambda_client.invoke.call_count, 3)
-
-    def test_list_functions(self):
-        """test listing all deployed functions"""
-        from hydraa_faas.faas_manager.aws_lambda import AwsLambda
-
-        provider = self._create_provider_with_mocks()
-
-        # mock paginator
-        mock_paginator = Mock()
-        provider._lambda_client.get_paginator.return_value = mock_paginator
-
-        # mock function list
-        mock_paginator.paginate.return_value = [
-            {
-                'Functions': [
-                    {
-                        'FunctionName': 'func1',
-                        'FunctionArn': 'arn:aws:lambda:us-east-1:123456789012:function:func1',
-                        'Runtime': 'python3.9',
-                        'Handler': 'index.handler',
-                        'MemorySize': 256,
-                        'Timeout': 30,
-                        'State': 'Active',
-                        'PackageType': 'Zip'
-                    },
-                    {
-                        'FunctionName': 'func2',
-                        'FunctionArn': 'arn:aws:lambda:us-east-1:123456789012:function:func2',
-                        'PackageType': 'Image',
-                        'State': 'Active'
-                    }
-                ]
-            }
-        ]
-
-        # list functions
-        functions = provider.list_functions()
-
-        # verify
-        self.assertEqual(len(functions), 2)
-        self.assertEqual(functions[0]['name'], 'func1')
-        self.assertEqual(functions[0]['runtime'], 'python3.9')
-        self.assertEqual(functions[1]['package_type'], 'Image')
-
-    def test_delete_function(self):
-        """test function deletion and cleanup"""
-        from hydraa_faas.faas_manager.aws_lambda import AwsLambda
-
-        provider = self._create_provider_with_mocks()
-
-        # add function to tracking
-        provider._deployed_functions['test-func'] = {
-            'arn': 'arn:aws:lambda:us-east-1:123456789012:function:test-func',
-            'created_at': time.time()
+        mock_response = {
+            'StatusCode': 200,
+            'Payload': mock_payload,
+            'LogResult': 'base64_logs'
         }
+        self.provider._lambda_client.invoke.return_value = mock_response
 
-        # create a task in functions book
-        task = MockTask()
-        task.name = 'test-func'
-        provider._functions_book['test-func'] = task
+        # Invoke
+        result = self.provider.invoke_function('test-function', {'input': 'data'})
 
-        # delete function
-        provider.delete_function('test-func')
-
-        # verify deletion
-        provider._lambda_client.delete_function.assert_called_once_with(
-            FunctionName='test-func'
+        self.assertEqual(result['statusCode'], 200)
+        self.assertEqual(result['payload'], {'result': 'success'})
+        self.provider._lambda_client.invoke.assert_called_once_with(
+            FunctionName='test-function',
+            Payload='{"input": "data"}',
+            LogType='Tail'
         )
-        self.assertNotIn('test-func', provider._deployed_functions)
-        self.assertNotIn('test-func', provider._functions_book)
 
-    def test_shutdown_with_auto_terminate(self):
-        """test provider shutdown cleans up resources when auto_terminate is true"""
-        from hydraa_faas.faas_manager.aws_lambda import AwsLambda
+    def test_invoke_function_not_found(self):
+        """Test invoking non-existent function."""
+        self.provider._functions = {}
 
-        provider = self._create_provider_with_mocks()
-        provider.auto_terminate = True
+        with self.assertRaises(InvocationException) as context:
+            self.provider.invoke_function('non-existent')
 
-        # add some deployed functions
-        provider._deployed_functions = {
-            'func1': {'arn': 'arn1', 'created_at': time.time()},
-            'func2': {'arn': 'arn2', 'created_at': time.time()}
+        self.assertIn('not found', str(context.exception))
+
+    def test_create_ecr_repository(self):
+        """Test ECR repository creation."""
+        # Mock resource manager to return new repo
+        self.provider.resource_manager.create_aws_ecr_repository.return_value = \
+            '123.dkr.ecr.us-east-1.amazonaws.com/repo'
+
+        # Create repository
+        repo_uri = self.provider._create_ecr_repository()
+
+        self.assertEqual(repo_uri, '123.dkr.ecr.us-east-1.amazonaws.com/repo')
+        self.provider.resource_manager.create_aws_ecr_repository.assert_called_once()
+
+    def test_shutdown_with_cleanup(self):
+        """Test provider shutdown with resource cleanup."""
+        # Setup functions to delete
+        self.provider._functions = {
+            'func1': {'arn': 'arn1'},
+            'func2': {'arn': 'arn2'}
         }
 
-        # add active deployment to test graceful shutdown
-        provider._active_deployments.add('func3')
+        # Since provider is in synchronous mode (asynchronous=False),
+        # there should be no worker thread
+        self.assertFalse(hasattr(self.provider, 'worker_thread'))
 
-        # mock cleanup methods
-        provider._cleanup_iam_role = Mock()
+        # Mock executor futures
+        mock_future = Mock()
+        mock_future.result.return_value = None
+        self.provider.executor.submit.return_value = mock_future
 
-        # shutdown
-        with patch('time.sleep'):  # speed up the test
-            provider.shutdown()
+        # Shutdown
+        self.provider.shutdown()
 
-        # verify termination
-        self.assertTrue(provider._terminate.is_set())
-        self.assertFalse(provider.status)
+        # Verify cleanup
+        self.assertTrue(self.provider._terminate.is_set())
 
-        # verify functions were deleted
-        self.assertEqual(provider._lambda_client.delete_function.call_count, 2)
+        # Verify delete functions were submitted
+        self.assertEqual(self.provider.executor.submit.call_count, 2)
 
-        # verify iam cleanup was attempted
-        provider._cleanup_iam_role.assert_called_once()
+        # Verify resource cleanup
+        self.provider.resource_manager.cleanup_aws_resources.assert_called_once()
+        self.provider.resource_manager.save_all_resources.assert_called_once()
 
-        # verify resource manager save was called
-        self.mock_resource_manager.save_all_resources.assert_called_once()
+        # Verify executor shutdown
+        self.provider.executor.shutdown.assert_called_once_with(wait=True)
 
-    def test_error_handling_in_deployment(self):
-        """test proper error handling during deployment failures"""
-        from hydraa_faas.faas_manager.aws_lambda import AwsLambda
+    def test_shutdown_async_mode(self):
+        """Test provider shutdown in async mode with worker thread."""
+        # Set provider to async mode
+        self.provider.asynchronous = True
 
-        provider = self._create_provider_with_mocks()
+        # Mock worker thread
+        self.provider.worker_thread = Mock()
+        self.provider.worker_thread.is_alive.return_value = True
 
-        # simulate deployment failure
-        provider._lambda_client.create_function.side_effect = Exception("Deployment failed")
+        # Mock executor
+        self.provider.executor.submit.return_value = Mock()
 
-        # create task
-        task = MockTask()
-        task.handler_code = "def handler(): pass"
+        # Shutdown
+        self.provider.shutdown()
 
-        # process task
-        provider._process_task(task)
-
-        # verify task marked as failed
-        self.assertEqual(task.state, 'FAILED')
-        self.assertNotIn(task.name, provider._deployed_functions)
-
-        # verify error was sent to outgoing queue
-        error_msg = provider.outgoing_q.get(timeout=1)
-        self.assertEqual(error_msg['state'], 'failed')
-        self.assertIn('error', error_msg)
-
-    def test_memory_normalization(self):
-        """test memory values are normalized to lambda constraints"""
-        from hydraa_faas.faas_manager.aws_lambda import AwsLambda
-
-        provider = self._create_provider_with_mocks()
-
-        # test various memory values
-        test_cases = [
-            (64, 128),      # below minimum
-            (256, 256),     # valid value
-            (15000, 10240), # above maximum
-            (512.5, 512),   # float to int
-        ]
-
-        for input_memory, expected in test_cases:
-            result = provider._normalize_memory(input_memory)
-            self.assertEqual(result, expected)
-
-    def _create_provider_with_mocks(self):
-        """helper to create a provider with all clients mocked"""
-        with patch('boto3.client'):
-            from hydraa_faas.faas_manager.aws_lambda import AwsLambda
-
-            provider = AwsLambda(
-                sandbox='test_sandbox',
-                manager_id='test_id',
-                cred=self.mock_creds,
-                asynchronous=True,
-                auto_terminate=False,
-                log=self.mock_logger,
-                resource_manager=self.mock_resource_manager
-            )
-
-            # replace clients with mocks
-            provider._lambda_client = Mock()
-            provider._iam_client = Mock()
-            provider._ecr_client = Mock()
-            provider.registry_manager = Mock()
-
-            # stop worker thread for cleaner testing
-            provider._terminate.set()
-            if provider.worker_thread and provider.worker_thread.is_alive():
-                provider.worker_thread.join(timeout=1)
-            provider._terminate.clear()
-
-            return provider
+        # Verify worker thread was stopped
+        self.assertTrue(self.provider._terminate.is_set())
+        self.provider.worker_thread.join.assert_called_once_with(timeout=5)
 
 
 if __name__ == '__main__':
