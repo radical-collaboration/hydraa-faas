@@ -4,8 +4,8 @@ httpx
 botocore
 pyyaml
 
-#dependencies hydraa failed to install
+# dependencies hydraa failed to install
 radical.utils
+radical.pilot
 python-blazarclient
 lexicon
-radical.pilot
