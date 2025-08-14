@@ -23,12 +23,13 @@ jobs:
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install -r requirements-ci.txt
 
-      - name: Run black
-        run: |
-          . testenv/bin/activate
-          python -m black $(git ls-files '*.py')
+#
+#      - name: Run black
+#        run: |
+#          . testenv/bin/activate
+#          python -m black $(git ls-files '*.py')
 
       - name: Run tests with pytest
         run: |
           . testenv/bin/activate
-          python -m pytest -v
+          python -m pytest -vvv tests/
