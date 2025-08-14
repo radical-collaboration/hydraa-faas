@@ -4,6 +4,7 @@ aiohttp
 boto3
 botocore
 httpx
+nuclio
 pyyaml
 
 # dependencies hydraa failed to install
