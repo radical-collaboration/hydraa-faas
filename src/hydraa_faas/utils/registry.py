@@ -221,7 +221,7 @@ class RegistryManager:
         return tagged_uri, push_metrics
 
     def build_and_push_image(self, source_path: str, repository_uri: str,
-                           image_tag: str = 'latest') -> Tuple[str, BuildMetrics, PushMetrics]:
+                             image_tag: str = 'latest') -> Tuple[str, BuildMetrics, PushMetrics]:
         """Builds a Docker image and pushes it to a registry.
 
         Args:
@@ -244,7 +244,7 @@ class RegistryManager:
 
         self._log_info(f"Successfully built and pushed image: {full_image_uri}")
         return full_image_uri, build_metrics, push_metrics
-        
+
     def create_ecr_repository(self, repository_name: str) -> str:
         """Creates an ECR repository if it doesn't exist.
 
@@ -375,10 +375,19 @@ class RegistryManager:
         Returns:
             The fully qualified image URI.
         """
-        if config.url and not image.startswith(config.url):
-            return f"{config.url.replace('https://', '')}/{image.split('/')[-1]}"
+        if config.type == RegistryType.ECR:
+            # For ECR, the image might already have the full URI
+            if config.url and config.url in image:
+                return image
+            # Otherwise construct it
+            if config.url and not image.startswith(config.url):
+                # Extract just the tag part if it includes repository name
+                tag_part = image.split('/')[-1]
+                return f"{config.url}/{tag_part}"
+        elif config.url and not image.startswith(config.url):
+            return f"{config.url.replace('https://', '').replace('http://', '')}/{image.split('/')[-1]}"
         return image
-        
+
     def _find_registry_by_uri(self, uri: str) -> Optional[str]:
         """Finds a configured registry name by its URI.
 
@@ -390,6 +399,18 @@ class RegistryManager:
         """
         with self._config_lock:
             for name, config in self._registry_configs.items():
-                if config.url and uri.startswith(config.url.replace('https://', '')):
-                    return name
+                if config.type == RegistryType.ECR:
+                    # For ECR, match if the registry URL is in the URI
+                    # config.url format: 123456789012.dkr.ecr.us-east-1.amazonaws.com
+                    # uri format: 123456789012.dkr.ecr.us-east-1.amazonaws.com/repo-name
+                    if config.url and uri.startswith(config.url):
+                        return name
+                    # Also check with region matching as fallback
+                    if '.dkr.ecr.' in uri and config.region and config.region in uri:
+                        return name
+                elif config.url:
+                    # For other registries, match URL prefix
+                    url_prefix = config.url.replace('https://', '').replace('http://', '')
+                    if uri.startswith(url_prefix):
+                        return name
         return None

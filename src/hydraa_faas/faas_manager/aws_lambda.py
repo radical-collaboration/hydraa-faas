@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
-"""AWS Lambda provider - Refactored for better HYDRA integration.
+"""AWS Lambda provider - Simplified resource provisioning.
 
-This module handles AWS Lambda deployments while following HYDRA patterns
-and using existing Task attributes effectively.
+This module handles AWS Lambda deployments with automatic resource detection
+and simplified provisioning following HYDRA patterns.
 """
 
 import json
@@ -30,7 +30,9 @@ from ..utils.resource_manager import ResourceManager
 LAMBDA_MAX_TIMEOUT = 900  # 15 minutes
 LAMBDA_MIN_MEMORY = 128
 LAMBDA_MAX_MEMORY = 10240
+SUPPORTED_PYTHON_RUNTIMES = ['python3.9', 'python3.10', 'python3.11', 'python3.12']
 DEFAULT_PYTHON_RUNTIME = 'python3.9'
+BASE_PYTHON_IMAGES = ['python:3.9', 'python:3.10', 'python:3.11', 'python:3.12']
 
 
 class AWSClientPool:
@@ -54,7 +56,7 @@ class AWSClientPool:
                 config = Config(
                     region_name=region,
                     retries={'max_attempts': 5, 'mode': 'adaptive'},
-                    max_pool_connections=50  # Increase connection pool
+                    max_pool_connections=50
                 )
 
                 self._clients[key] = boto3.client(
@@ -68,7 +70,7 @@ class AWSClientPool:
 
 
 class AwsLambda:
-    """AWS Lambda provider following HYDRA patterns."""
+    """AWS Lambda provider with simplified resource provisioning."""
 
     def __init__(self,
                  sandbox: str,
@@ -88,7 +90,7 @@ class AwsLambda:
             asynchronous: Whether to process asynchronously.
             auto_terminate: Whether to cleanup on shutdown.
             log: HYDRA logger instance.
-            resource_config: Provider configuration.
+            resource_config: Provider configuration (used for VPC only).
             profiler: HYDRA profiler instance.
         """
         self.sandbox = sandbox
@@ -145,6 +147,9 @@ class AwsLambda:
             thread_name_prefix="Lambda"
         )
 
+        # IAM role (always created/reused, never user-provided)
+        self._iam_role_arn = None
+
         # Initialize resources
         self._setup_resources()
 
@@ -158,34 +163,79 @@ class AwsLambda:
             self.worker_thread.start()
 
     def _setup_resources(self) -> None:
-        """Set up AWS resources with HYDRA patterns."""
+        """Set up AWS resources - only IAM role at startup."""
         self.logger.trace("Setting up AWS Lambda resources")
         self.profiler.prof('lambda_setup_start', uid=self.manager_id)
 
-        # Create IAM role if not provided
-        if not self.resource_config.get('iam_role'):
-            role_name = f"hydra-lambda-role-{self.manager_id}"
-            role_arn = self.resource_manager.create_aws_iam_role(
-                role_name,
-                self._iam_client
-            )
-            self.resource_config['iam_role'] = role_arn
+        # Always create/reuse IAM role (no user input)
+        self._setup_iam_role()
 
-        # Setup ECR if container support enabled
-        if self.resource_config.get('enable_container_support', False):
-            repo_name = f"hydra-faas-{self.manager_id}"
-            repo_uri = self.resource_manager.create_aws_ecr_repository(
-                repo_name,
-                self._ecr_client
-            )
-            ecr_config = RegistryConfig(
-                type=RegistryType.ECR,
-                region=self.region
-            )
-            self.registry_manager.configure_registry('aws_ecr', ecr_config)
+        # ECR is created on-demand during deployment if needed
 
         self.profiler.prof('lambda_setup_end', uid=self.manager_id)
         self.logger.trace("AWS Lambda resources ready")
+
+    def _setup_iam_role(self) -> None:
+        """Create or reuse IAM role for Lambda execution."""
+        # Check for existing role from previous sessions
+        if self.resource_manager.aws_resources.iam_role_arn:
+            # Validate it still exists
+            try:
+                role_name = self.resource_manager.aws_resources.iam_role_name
+                self._iam_client.get_role(RoleName=role_name)
+                self._iam_role_arn = self.resource_manager.aws_resources.iam_role_arn
+                self.logger.trace(f"Reusing existing IAM role: {role_name}")
+                return
+            except ClientError:
+                self.logger.trace("Previous IAM role not found, creating new one")
+
+        # Create new role
+        role_name = f"hydra-lambda-role-{self.manager_id}"
+        self._iam_role_arn = self.resource_manager.create_aws_iam_role(
+            role_name,
+            self._iam_client
+        )
+        self.resource_manager.save_all_resources()
+
+    def _create_ecr_repository(self) -> str:
+        """Create ECR repository on-demand for container builds."""
+        # Check if already created
+        if self.resource_manager.aws_resources.ecr_repository_uri:
+            repo_uri = self.resource_manager.aws_resources.ecr_repository_uri
+            # Extract registry URL from repo URI
+            # repo_uri format: 123456789012.dkr.ecr.us-east-1.amazonaws.com/repo-name
+            registry_url = repo_uri.split('/')[0]
+
+            # Configure registry manager for existing repo
+            ecr_config = RegistryConfig(
+                type=RegistryType.ECR,
+                region=self.region,
+                url=registry_url  # Don't add https:// prefix
+            )
+            self.registry_manager.configure_registry('aws_ecr', ecr_config)
+            return repo_uri
+
+        # Create new repository
+        repo_name = f"hydra-faas-{self.manager_id}"
+        repo_uri = self.resource_manager.create_aws_ecr_repository(
+            repo_name,
+            self._ecr_client
+        )
+
+        # Extract registry URL from repo URI
+        # repo_uri format: 123456789012.dkr.ecr.us-east-1.amazonaws.com/repo-name
+        registry_url = repo_uri.split('/')[0]
+
+        # Configure registry manager with proper URL
+        ecr_config = RegistryConfig(
+            type=RegistryType.ECR,
+            region=self.region,
+            url=registry_url  # Don't add https:// prefix
+        )
+        self.registry_manager.configure_registry('aws_ecr', ecr_config)
+
+        self.resource_manager.save_all_resources()
+        return repo_uri
 
     def _worker(self) -> None:
         """Worker thread for async processing."""
@@ -208,7 +258,7 @@ class AwsLambda:
             task: HYDRA Task object.
 
         Returns:
-            Function identifier (ARN).
+            Function identifier (name).
         """
         self.profiler.prof('lambda_deploy_start', uid=str(task.id))
 
@@ -216,17 +266,15 @@ class AwsLambda:
             # Extract FaaS configuration from Task
             faas_config = self._extract_faas_config(task)
 
-            # Validate configuration
-            self._validate_faas_config(faas_config, self._determine_deployment_type(task))
-
             # Generate unique function name
             function_name = self._generate_function_name(task)
 
-            # Determine deployment type
-            deployment_type = self._determine_deployment_type(task)
+            # Determine deployment type automatically
+            deployment_type = self._determine_deployment_type(task, faas_config)
+            self.logger.trace(f"Auto-detected deployment type: {deployment_type} for task {task.id}")
 
-            # Create deployment package
-            package_content = self._create_package(task, deployment_type)
+            # Create deployment package based on type
+            package_content = self._create_package(task, deployment_type, faas_config)
 
             # Deploy to Lambda
             function_arn = self._deploy_to_lambda(
@@ -261,8 +309,9 @@ class AwsLambda:
         # Group tasks by deployment type for optimization
         tasks_by_type = {}
         for task in tasks:
-            dep_type = self._determine_deployment_type(task)
-            tasks_by_type.setdefault(dep_type, []).append(task)
+            faas_config = self._extract_faas_config(task)
+            dep_type = self._determine_deployment_type(task, faas_config)
+            tasks_by_type.setdefault(dep_type, []).append((task, faas_config))
 
         results = []
         all_futures = {}
@@ -273,15 +322,15 @@ class AwsLambda:
                 # Parallelize packaging
                 with ThreadPoolExecutor(max_workers=10) as package_executor:
                     package_futures = {}
-                    for task in task_group:
-                        future = package_executor.submit(self._prepare_zip_deployment, task)
-                        package_futures[future] = task
+                    for task, faas_config in task_group:
+                        future = package_executor.submit(self._prepare_zip_deployment, task, faas_config)
+                        package_futures[future] = (task, faas_config)
 
                     # Deploy as packages complete
                     for future in as_completed(package_futures):
-                        task = package_futures[future]
+                        task, faas_config = package_futures[future]
                         try:
-                            function_name, package_content, faas_config = future.result()
+                            function_name, package_content = future.result()
                             deploy_future = self.executor.submit(
                                 self._deploy_to_lambda,
                                 task, function_name, package_content, dep_type, faas_config
@@ -290,23 +339,20 @@ class AwsLambda:
                         except Exception as e:
                             task.set_exception(e)
 
-            elif dep_type == 'container':
-                # Batch prepare container deployments
-                deployment_configs = []
-                for task in task_group:
+            elif dep_type in ['container-build', 'prebuilt-image']:
+                # Process container deployments
+                for task, faas_config in task_group:
                     try:
-                        config = self._prepare_container_deployment(task)
-                        deployment_configs.append((task, config))
+                        function_name = self._generate_function_name(task)
+                        package = self._create_package(task, dep_type, faas_config)
+
+                        future = self.executor.submit(
+                            self._deploy_to_lambda,
+                            task, function_name, package, dep_type, faas_config
+                        )
+                        all_futures[future] = (task, function_name)
                     except Exception as e:
                         task.set_exception(e)
-
-                # Deploy containers in parallel
-                for task, (function_name, image_uri, faas_config) in deployment_configs:
-                    future = self.executor.submit(
-                        self._deploy_to_lambda,
-                        task, function_name, image_uri, dep_type, faas_config
-                    )
-                    all_futures[future] = (task, function_name)
 
         # Collect results
         for future in as_completed(all_futures):
@@ -318,7 +364,7 @@ class AwsLambda:
                     self._functions[function_name] = {
                         'arn': function_arn,
                         'task_id': str(task.id),
-                        'deployment_type': self._determine_deployment_type(task)
+                        'deployment_type': self._determine_deployment_type(task, self._extract_faas_config(task))
                     }
                 results.append(function_name)
                 task.set_result(function_name)
@@ -329,21 +375,11 @@ class AwsLambda:
         self.profiler.prof('lambda_batch_end', uid=self.manager_id)
         return results
 
-    def _prepare_zip_deployment(self, task: Task) -> tuple:
+    def _prepare_zip_deployment(self, task: Task, faas_config: Dict[str, Any]) -> tuple:
         """Prepare a zip deployment package."""
-        faas_config = self._extract_faas_config(task)
-        self._validate_faas_config(faas_config, 'zip')
         function_name = self._generate_function_name(task)
-        package_content = self._create_package(task, 'zip')
-        return function_name, package_content, faas_config
-
-    def _prepare_container_deployment(self, task: Task) -> tuple:
-        """Prepare a container deployment."""
-        faas_config = self._extract_faas_config(task)
-        self._validate_faas_config(faas_config, 'container')
-        function_name = self._generate_function_name(task)
-        image_uri = self._create_package(task, 'container')
-        return function_name, image_uri, faas_config
+        package_content = self._create_package(task, 'zip', faas_config)
+        return function_name, package_content
 
     def _extract_faas_config(self, task: Task) -> Dict[str, Any]:
         """Extract FaaS configuration from Task's env_var."""
@@ -356,37 +392,31 @@ class AwsLambda:
                     if key.startswith('FAAS_'):
                         config[key.replace('FAAS_', '').lower()] = value
 
-        # Defaults
-        config.setdefault('handler', 'handler.handler')
-        config.setdefault('runtime', DEFAULT_PYTHON_RUNTIME)
-        config.setdefault('timeout', '30')
-        config.setdefault('source', '')
-
         return config
 
-    def _validate_faas_config(self, config: Dict[str, Any], deployment_type: str) -> None:
-        """Validate FaaS configuration before deployment."""
-        # Validate handler format
-        handler = config.get('handler', '')
-        if deployment_type == 'zip' and (not handler or '.' not in handler):
-            raise DeploymentException(f"Invalid handler format: {handler}. Expected 'module.function'")
+    def _extract_granular_config(self, task: Task) -> Dict[str, Any]:
+        """Extract granular Lambda configuration from env vars."""
+        granular = {}
 
-        # Validate runtime
-        runtime = config.get('runtime', '')
-        valid_runtimes = ['python3.9', 'python3.10', 'python3.11', 'python3.12']
-        if deployment_type == 'zip' and runtime not in valid_runtimes:
-            raise DeploymentException(f"Invalid runtime: {runtime}. Valid options: {valid_runtimes}")
+        if task.env_var:
+            for var in task.env_var:
+                if isinstance(var, str) and '=' in var:
+                    key, value = var.split('=', 1)
+                    if key.startswith('FAAS_') and key not in ['FAAS_PROVIDER', 'FAAS_SOURCE',
+                                                               'FAAS_HANDLER', 'FAAS_RUNTIME',
+                                                               'FAAS_TIMEOUT', 'FAAS_REGISTRY_URI']:
+                        # These are granular configs
+                        config_key = key.replace('FAAS_', '').lower()
+                        try:
+                            # Try to parse JSON strings
+                            if value.startswith('{') or value.startswith('['):
+                                granular[config_key] = json.loads(value)
+                            else:
+                                granular[config_key] = value
+                        except json.JSONDecodeError:
+                            granular[config_key] = value
 
-        # Validate timeout
-        timeout = int(config.get('timeout', 30))
-        if timeout < 1 or timeout > LAMBDA_MAX_TIMEOUT:
-            raise DeploymentException(f"Invalid timeout: {timeout}. Must be between 1 and {LAMBDA_MAX_TIMEOUT}")
-
-        # Validate source path for source-based deployments
-        if deployment_type in ['zip', 'source-to-image']:
-            source = config.get('source', '')
-            if source and not os.path.exists(source):
-                raise DeploymentException(f"Source path does not exist: {source}")
+        return granular
 
     def _generate_function_name(self, task: Task) -> str:
         """Generate Lambda-compatible function name."""
@@ -395,61 +425,136 @@ class AwsLambda:
         clean_name = ''.join(c for c in base_name if c.isalnum() or c in '-_')
         return f"hydra-{self.manager_id}-{clean_name}"[:64]  # Lambda limit
 
-    def _determine_deployment_type(self, task: Task) -> str:
-        """Determine deployment type from Task attributes."""
-        if task.image and task.image != 'python:3.9':
-            return 'container'
-        return 'zip'
+    def _determine_deployment_type(self, task: Task, faas_config: Dict[str, Any]) -> str:
+        """Automatically determine deployment type from task attributes."""
+        # Check if it's a prebuilt image (full URI)
+        if hasattr(task, 'image') and task.image and self._is_full_image_uri(task.image):
+            return 'prebuilt-image'
 
-    def _create_package(self, task: Task, deployment_type: str) -> Union[bytes, str]:
+        # Get source path
+        source_path = faas_config.get('source')
+
+        # Has source + image = container build
+        if source_path and hasattr(task, 'image') and task.image:
+            return 'container-build'
+
+        # Has source only = zip
+        if source_path:
+            return 'zip'
+
+        # Check for inline code
+        if task.cmd and len(task.cmd) > 2 and task.cmd[0] == 'python' and task.cmd[1] == '-c':
+            # Inline code + image = container build
+            if hasattr(task, 'image') and task.image:
+                return 'container-build'
+            # Inline code only = zip
+            return 'zip'
+
+        raise DeploymentException(
+            "Cannot determine deployment type. Provide either:\n"
+            "1. image with full URI (prebuilt-image)\n"
+            "2. FAAS_SOURCE=/path/to/code (zip)\n"
+            "3. FAAS_SOURCE + image (container-build)\n"
+            "4. inline code via cmd (zip or container-build)"
+        )
+
+    def _is_full_image_uri(self, image: str) -> bool:
+        """Check if image is a full URI (not just a base runtime)."""
+        # Base Python runtimes
+        if image in BASE_PYTHON_IMAGES:
+            return False
+
+        # Full URIs contain registry/repo:tag or at least a slash
+        return ('/' in image or
+                image.startswith(('http://', 'https://')) or
+                '.dkr.ecr.' in image or
+                '.amazonaws.com' in image)
+
+    def _create_package(self, task: Task, deployment_type: str, faas_config: Dict[str, Any]) -> Union[bytes, str]:
         """Create deployment package based on type."""
-        faas_config = self._extract_faas_config(task)
+        if deployment_type == 'prebuilt-image':
+            # Just return the image URI, no building needed
+            image_uri = task.image
+            if image_uri.startswith('ecr:'):
+                image_uri = image_uri.replace('ecr:', '')
+            self.logger.trace(f"Using prebuilt image: {image_uri}")
+            return image_uri
 
-        if deployment_type == 'container':
-            # Use task.image for container deployments
-            if task.image.startswith('ecr:'):
-                # Pre-built image
-                return task.image.replace('ecr:', '')
+        elif deployment_type == 'container-build':
+            # Need to build and push to registry
+            source_path = faas_config.get('source')
+
+            # Check if task specifies custom registry
+            registry_uri = faas_config.get('registry_uri')
+            if registry_uri:
+                repo_uri = registry_uri
+                self.logger.trace(f"Using custom registry: {repo_uri}")
             else:
-                # Build from source
-                source_path = faas_config.get('source', '')
-                if not source_path:
-                    raise DeploymentException("Container deployment requires source_path")
+                # Create ECR repository on-demand
+                repo_uri = self._create_ecr_repository()
+                self.logger.trace(f"Using auto-created ECR: {repo_uri}")
 
-                repo_uri = self.resource_manager.aws_resources.ecr_repository_uri
-                if not repo_uri:
-                    raise DeploymentException("ECR repository not configured")
+            # Use inline code if no source path
+            if not source_path and task.cmd and len(task.cmd) > 2:
+                source_path = self._create_source_from_inline_code(task, faas_config)
 
-                image_uri, _, _ = self.registry_manager.build_and_push_image(
-                    source_path=source_path,
-                    repository_uri=repo_uri,
-                    image_tag=task.name
-                )
-                return image_uri
-        else:
-            # ZIP deployment
-            if task.cmd and len(task.cmd) > 2:
-                # Inline code from task.cmd
-                code = task.cmd[2] if task.cmd[0] == 'python' and task.cmd[1] == '-c' else ''
-                if code:
-                    # Create temporary source file
-                    source_dir = os.path.join(self.sandbox, f"task_{task.id}")
-                    os.makedirs(source_dir, exist_ok=True)
+            if not source_path:
+                raise DeploymentException("Container build requires source path or inline code")
 
-                    handler_file = os.path.join(source_dir, "handler.py")
-                    with open(handler_file, 'w') as f:
-                        f.write(code)
+            # Build and push image
+            image_uri, _, _ = self.registry_manager.build_and_push_image(
+                source_path=source_path,
+                repository_uri=repo_uri,
+                image_tag=self._generate_function_name(task)
+            )
+            return image_uri
 
-                    zip_content, _, _ = create_deployment_package(source_dir)
-                    return zip_content
+        else:  # zip deployment
+            source_path = faas_config.get('source')
 
-            # External source
-            source_path = faas_config.get('source', '')
-            if source_path:
-                zip_content, _, _ = create_deployment_package(source_path)
-                return zip_content
+            # Use inline code if no source path
+            if not source_path and task.cmd and len(task.cmd) > 2:
+                source_path = self._create_source_from_inline_code(task, faas_config)
 
-            raise DeploymentException("No source code provided for deployment")
+            if not source_path:
+                raise DeploymentException("Zip deployment requires source path or inline code")
+
+            # Create zip package
+            zip_content, _, _ = create_deployment_package(source_path)
+            return zip_content
+
+    def _create_source_from_inline_code(self, task: Task, faas_config: Dict[str, Any]) -> str:
+        """Create temporary source directory from inline code."""
+        if not (task.cmd and len(task.cmd) > 2 and task.cmd[0] == 'python' and task.cmd[1] == '-c'):
+            raise DeploymentException("No inline code found in task.cmd")
+
+        code = task.cmd[2]
+        source_dir = os.path.join(self.sandbox, f"task_{task.id}_source")
+        os.makedirs(source_dir, exist_ok=True)
+
+        # Create handler file
+        handler_file = os.path.join(source_dir, "handler.py")
+        with open(handler_file, 'w') as f:
+            # Ensure the code has a handler function
+            if 'def handler' not in code:
+                # Wrap the code in a handler function
+                f.write("def handler(event, context):\n")
+                indented_code = '\n'.join(f"    {line}" for line in code.split('\n'))
+                f.write(indented_code)
+                f.write("\n    return {'statusCode': 200, 'body': 'Success'}\n")
+            else:
+                f.write(code)
+
+        # Create Dockerfile if container build
+        if self._determine_deployment_type(task, faas_config) == 'container-build':
+            dockerfile = os.path.join(source_dir, "Dockerfile")
+            with open(dockerfile, 'w') as f:
+                f.write(f"""FROM public.ecr.aws/lambda/python:3.9
+COPY handler.py ${{LAMBDA_TASK_ROOT}}
+CMD ["handler.handler"]
+""")
+
+        return source_dir
 
     def _deploy_to_lambda(self, task: Task, function_name: str,
                           package: Union[bytes, str], deployment_type: str,
@@ -466,9 +571,20 @@ class AwsLambda:
             LAMBDA_MAX_TIMEOUT
         )
 
+        # Validate runtime (Python only)
+        runtime = faas_config.get('runtime', DEFAULT_PYTHON_RUNTIME)
+        if runtime not in SUPPORTED_PYTHON_RUNTIMES:
+            raise DeploymentException(
+                f"Unsupported runtime: {runtime}. "
+                f"Only Python runtimes are supported: {SUPPORTED_PYTHON_RUNTIMES}"
+            )
+
+        # Extract granular configuration
+        granular_config = self._extract_granular_config(task)
+
         params = {
             'FunctionName': function_name,
-            'Role': self.resource_config.get('iam_role'),
+            'Role': self._iam_role_arn,
             'Timeout': timeout,
             'MemorySize': memory,
             'Environment': {
@@ -476,24 +592,39 @@ class AwsLambda:
             }
         }
 
-        if deployment_type == 'container':
+        # Apply granular configurations
+        if 'ephemeral_storage' in granular_config:
+            params['EphemeralStorage'] = {'Size': int(granular_config['ephemeral_storage'])}
+
+        if 'reserved_concurrent_executions' in granular_config:
+            params['ReservedConcurrentExecutions'] = int(granular_config['reserved_concurrent_executions'])
+
+        if 'layers' in granular_config:
+            params['Layers'] = granular_config['layers'].split(',') if isinstance(granular_config['layers'], str) else \
+            granular_config['layers']
+
+        if 'dead_letter_queue' in granular_config:
+            params['DeadLetterConfig'] = {'TargetArn': granular_config['dead_letter_queue']}
+
+        if 'tracing_config' in granular_config:
+            params['TracingConfig'] = {'Mode': granular_config['tracing_config']}
+
+        if deployment_type in ['container-build', 'prebuilt-image']:
             params.update({
                 'PackageType': 'Image',
                 'Code': {'ImageUri': package}
             })
-        else:
+        else:  # zip
             params.update({
-                'Runtime': faas_config.get('runtime', DEFAULT_PYTHON_RUNTIME),
+                'Runtime': runtime,
                 'Handler': faas_config.get('handler', 'handler.handler'),
                 'Code': {'ZipFile': package}
             })
 
-        # Add VPC config if available
-        if self.resource_config.get('subnet_ids'):
-            params['VpcConfig'] = {
-                'SubnetIds': self.resource_config['subnet_ids'],
-                'SecurityGroupIds': self.resource_config.get('security_groups', [])
-            }
+        # Add VPC config if available from resource_config or VMs
+        vpc_config = self._get_vpc_config()
+        if vpc_config:
+            params['VpcConfig'] = vpc_config
 
         try:
             response = self._lambda_client.create_function(**params)
@@ -511,13 +642,22 @@ class AwsLambda:
             else:
                 raise
 
+    def _get_vpc_config(self) -> Optional[Dict[str, Any]]:
+        """Extract VPC configuration from resource_config (from VMs)."""
+        if self.resource_config.get('subnet_ids'):
+            return {
+                'SubnetIds': self.resource_config['subnet_ids'],
+                'SecurityGroupIds': self.resource_config.get('security_groups', [])
+            }
+        return None
+
     def _update_function(self, function_name: str, package: Union[bytes, str],
                          deployment_type: str, params: Dict[str, Any]) -> str:
         """Update existing Lambda function."""
         self.logger.trace(f"Updating existing function: {function_name}")
 
         # Update code
-        if deployment_type == 'container':
+        if deployment_type in ['container-build', 'prebuilt-image']:
             self._lambda_client.update_function_code(
                 FunctionName=function_name,
                 ImageUri=package
@@ -552,11 +692,18 @@ class AwsLambda:
         """Extract environment variables from Task."""
         env_vars = {}
 
-        if task.env_var:
+        # Use the stored user env vars (non-FAAS_*)
+        if hasattr(task, '_user_env_vars'):
+            for var in task._user_env_vars:
+                if isinstance(var, str) and '=' in var:
+                    key, value = var.split('=', 1)
+                    env_vars[key] = value
+        elif task.env_var:
+            # Fallback if _user_env_vars not set
             for var in task.env_var:
                 if isinstance(var, str) and '=' in var:
                     key, value = var.split('=', 1)
-                    if not key.startswith('FAAS_'):  # Skip FaaS config
+                    if not key.startswith('FAAS_'):
                         env_vars[key] = value
 
         return env_vars
@@ -651,6 +798,9 @@ class AwsLambda:
                 self._iam_client,
                 self._ecr_client
             )
+
+        # Save resource state
+        self.resource_manager.save_all_resources()
 
         # Shutdown executor
         self.executor.shutdown(wait=True)

@@ -35,19 +35,13 @@ import matplotlib.patches as mpatches
 import numpy as np
 import seaborn as sns
 
-# Add project root to path
-try:
-    from hydraa import Task, proxy
-    from hydraa_faas.faas_manager.manager import FaasManager
-    from hydraa_faas.utils.exceptions import FaasException
-    from hydraa_faas.utils.metrics_collector import MetricsCollector
-    # Import packaging to clear cache
-    from hydraa_faas.utils.packaging import clear_package_cache
-except ImportError:
-    print("Error: Could not import hydraa_faas modules.")
-    print("Please ensure the script is run from the project's root directory,")
-    print("or that the project is installed as a package.")
-    sys.exit(1)
+
+# from hydraa import Task, proxy
+# from hydraa_faas.faas_manager.manager import FaasManager
+# from hydraa_faas.utils.exceptions import FaasException
+# from hydraa_faas.utils.metrics_collector import MetricsCollector
+
+
 
 # --- Benchmark Configuration ---
 BENCHMARK_OUTPUT_DIR = Path(__file__).parent / "benchmark_results"
@@ -69,17 +63,17 @@ DYNAMIC_HTML_HANDLER = "webapps_100.dynamic_html_110.python.function.handler"
 PREWARM_INVOCATIONS = 0
 PLOT_FONTS = {
     'bar': {
-        'title_size': 50,
+        'title_size': 70,
         'title_weight': 'bold',
-        'axis_label_size': 40,
-        'axis_label_pad': 20,
-        'axis_tick_size': 36,
-        'x_tick_size': 36,
-        'legend_size': 28,
-        'legend_title_size': 30,
-        'data_label_size': 22,
+        'axis_label_size': 50,
+        'axis_label_pad': 40,
+        'axis_tick_size': 46,
+        'x_tick_size': 46,
+        'legend_size': 38,
+        'legend_title_size': 40,
+        'data_label_size': 32,
         'data_label_weight': 'bold',
-        'total_annotation_size': 26,
+        'total_annotation_size': 36,
     },
 
     'box': {
@@ -94,7 +88,7 @@ PLOT_FONTS = {
 
 
     'invocation_bar': {
-        'x_tick_size': 28,
+        'x_tick_size': 38,
     }
 }
 

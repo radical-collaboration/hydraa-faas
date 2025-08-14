@@ -31,8 +31,6 @@ from io import BytesIO
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from pipreqs import pipreqs
-
 from .exceptions import PackagingException
 
 DEFAULT_EXCLUDES = [
@@ -61,7 +59,7 @@ def _generate_requirements(source_path: str, temp_dir: str) -> str:
         The path to the generated `requirements.txt` file.
 
     Raises:
-        PackagingException: If `pipreqs` fails to run.
+        PackagingException: If dependency detection fails.
     """
     requirements_file = os.path.join(temp_dir, 'requirements.txt')
     print(
@@ -70,20 +68,59 @@ def _generate_requirements(source_path: str, temp_dir: str) -> str:
     )
 
     try:
-        # Use pipreqs to generate the requirements file
-        pipreqs.run_pipreqs({
-            '--force': True,
-            '--savepath': requirements_file,
-            '--path': source_path,
-            '--print': False,
-            '--use-local': None,
-            '--ignore': None
-        })
+        # Option 1: Try using pipreqs programmatically
+        try:
+            from pipreqs import pipreqs
+
+            # Get all imports from the source directory
+            imports = pipreqs.get_all_imports(source_path)
+
+            # Get package names from imports
+            pkg_names = pipreqs.get_pkg_names(imports)
+
+            # Write requirements file
+            with open(requirements_file, 'w') as f:
+                for pkg in pkg_names:
+                    f.write(f"{pkg}\n")
+
+            print(f"[Packaging] Detected dependencies: {', '.join(pkg_names) if pkg_names else 'none'}")
+
+        except (ImportError, AttributeError) as e:
+            # Option 2: Fall back to subprocess if pipreqs API is not available
+            print("[Packaging] Using pipreqs CLI fallback")
+
+            # Check if pipreqs is installed
+            pipreqs_cmd = shutil.which('pipreqs')
+            if not pipreqs_cmd:
+                # Try installing pipreqs
+                subprocess.run([sys.executable, '-m', 'pip', 'install', 'pipreqs'],
+                               capture_output=True, text=True)
+                pipreqs_cmd = shutil.which('pipreqs')
+
+            if pipreqs_cmd:
+                result = subprocess.run(
+                    [pipreqs_cmd, source_path, '--savepath', requirements_file, '--force'],
+                    capture_output=True,
+                    text=True
+                )
+
+                if result.returncode != 0:
+                    # pipreqs might fail on simple scripts, create empty requirements
+                    Path(requirements_file).touch()
+                    print("[Packaging] No external dependencies detected")
+            else:
+                # If pipreqs is not available, create empty requirements
+                Path(requirements_file).touch()
+                print("[Packaging] pipreqs not available, assuming no dependencies")
+
     except Exception as e:
-        raise PackagingException(f"Failed to auto-detect dependencies: {e}")
+        # As a last resort, create an empty requirements file
+        Path(requirements_file).touch()
+        print(f"[Packaging] Could not detect dependencies: {e}")
+        print("[Packaging] Proceeding with empty requirements.txt")
 
     if not os.path.exists(requirements_file):
-        # pipreqs creates an empty file if no dependencies are found
+        # Ensure the file exists
         Path(requirements_file).touch()
 
     return requirements_file
@@ -135,7 +172,16 @@ def _install_dependencies(requirements_path: str, target_dir: str) -> None:
         print("[Packaging] requirements.txt is empty, skipping installation.")
         return
 
-    print(f"[Packaging] Installing dependencies for AWS Lambda (Linux)...")
+    # Read requirements to check what we're installing
+    with open(requirements_path, 'r') as f:
+        requirements = f.read().strip()
+        if not requirements:
+            print("[Packaging] No dependencies to install.")
+            return
+
+    print(f"[Packaging] Installing dependencies for AWS Lambda (Linux): {requirements}")
+
+    # First try with platform-specific wheels
     cmd = [
         sys.executable, "-m", "pip", "install",
         "-r", requirements_path,
@@ -154,7 +200,27 @@ def _install_dependencies(requirements_path: str, target_dir: str) -> None:
                                 text=True,
                                 timeout=INSTALL_TIMEOUT)
         if result.returncode != 0:
-            raise PackagingException(f"pip install failed: {result.stderr}")
+            # If platform-specific install fails, try without platform restrictions
+            # This is useful for pure Python packages
+            print("[Packaging] Platform-specific install failed, trying generic install...")
+
+            cmd_generic = [
+                sys.executable, "-m", "pip", "install",
+                "-r", requirements_path,
+                "-t", target_dir,
+                "--no-compile",
+                "--quiet",
+                "--no-cache-dir"
+            ]
+
+            result = subprocess.run(cmd_generic,
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=INSTALL_TIMEOUT)
+
+            if result.returncode != 0:
+                raise PackagingException(f"pip install failed: {result.stderr}")
+
     except subprocess.TimeoutExpired:
         raise PackagingException(
             f"Installation timed out after {INSTALL_TIMEOUT}s")

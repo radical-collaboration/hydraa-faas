@@ -37,8 +37,7 @@ class FaasManager:
                  proxy_mgr: proxy,
                  vms: Optional[List[Any]] = None,
                  asynchronous: bool = True,
-                 auto_terminate: bool = True,
-                 resource_config: Optional[Dict[str, Any]] = None):
+                 auto_terminate: bool = True):
         """Initializes the FaasManager following HYDRA patterns.
 
         Args:
@@ -46,13 +45,11 @@ class FaasManager:
             vms: List of VM definitions for infrastructure.
             asynchronous: If True, tasks run in background.
             auto_terminate: If True, cleanup resources on shutdown.
-            resource_config: Provider-specific configuration.
         """
         self._proxy = proxy_mgr
         self.vms = vms or []
         self.asynchronous = asynchronous
         self.auto_terminate = auto_terminate
-        self.resource_config = resource_config or {}
 
         # HYDRA ServiceManager expectations
         self.incoming_q = queue.Queue()
@@ -183,9 +180,6 @@ class FaasManager:
         lambda_sandbox = os.path.join(self.sandbox, 'lambda')
         os.makedirs(lambda_sandbox, exist_ok=True)
 
-        # Merge infrastructure config with resource config
-        combined_config = {**self.resource_config.get('aws', {}), **infra_config}
-
         provider = AwsLambda(
             sandbox=lambda_sandbox,
             manager_id=uuid.uuid4().hex[:8],
@@ -193,7 +187,7 @@ class FaasManager:
             asynchronous=self.asynchronous,
             auto_terminate=self.auto_terminate,
             log=self.logger,
-            resource_config=combined_config,
+            resource_config=infra_config,
             profiler=self.profiler
         )
         return {'instance': provider, 'type': 'lambda'}
@@ -206,9 +200,6 @@ class FaasManager:
         # Determine credential source from VMs
         vm_provider = self.vms[0].Provider if self.vms else 'local'
 
-        # Merge configs
-        combined_config = {**self.resource_config.get('nuclio', {}), **infra_config}
-
         provider = NuclioProvider(
             sandbox=nuclio_sandbox,
             manager_id=uuid.uuid4().hex[:8],
@@ -217,7 +208,7 @@ class FaasManager:
             asynchronous=self.asynchronous,
             auto_terminate=self.auto_terminate,
             log=self.logger,
-            resource_config=combined_config,
+            resource_config=infra_config,
             profiler=self.profiler
         )
         return {'instance': provider, 'type': 'nuclio'}
@@ -289,35 +280,71 @@ class FaasManager:
         if not task.memory:
             task.memory = 256  # Default memory
 
-        # Store FaaS config in env_var
-        faas_config = {
-            'FAAS_HANDLER': getattr(task, 'handler', 'handler.handler'),
-            'FAAS_RUNTIME': getattr(task, 'runtime', 'python3.9'),
-            'FAAS_TIMEOUT': str(getattr(task, 'timeout', 30)),
-            'FAAS_SOURCE': getattr(task, 'source_path', '')
-        }
+        # Extract and separate FaaS config from user env vars
+        faas_config = self._extract_faas_config(task)
 
+        # Store processed FaaS config back in env_var for providers
         if not task.env_var:
             task.env_var = []
 
+        # Add back FaaS config
         for key, value in faas_config.items():
-            task.env_var.append(f"{key}={value}")
+            task.env_var.append(f"FAAS_{key.upper()}={value}")
+
+    def _extract_faas_config(self, task: Task) -> Dict[str, Any]:
+        """Extract FaaS configuration from FAAS_* env vars."""
+        faas_config = {}
+        user_env_vars = []
+
+        if task.env_var:
+            new_env_var = []
+            for var in task.env_var:
+                if isinstance(var, str) and '=' in var:
+                    key, value = var.split('=', 1)
+                    if key.startswith('FAAS_'):
+                        # FaaS configuration
+                        config_key = key.replace('FAAS_', '').lower()
+                        faas_config[config_key] = value
+                    else:
+                        # User runtime environment variable
+                        user_env_vars.append(var)
+                        new_env_var.append(var)
+                else:
+                    new_env_var.append(var)
+
+            # Update task env_var to only contain user vars
+            task.env_var = new_env_var
+
+        # Store user env vars for providers to use
+        task._user_env_vars = user_env_vars
+
+        # Apply defaults
+        faas_config.setdefault('handler', 'handler.handler')
+        faas_config.setdefault('runtime', 'python3.9')
+        faas_config.setdefault('timeout', '30')
+        faas_config.setdefault('source', '')
+
+        return faas_config
 
     def _get_task_provider(self, task: Task) -> str:
         """Determine which provider should handle the task."""
-        # Check if provider explicitly set
-        provider = getattr(task, 'provider', '').lower()
+        # Check FAAS_PROVIDER env var first
+        if task.env_var:
+            for var in task.env_var:
+                if isinstance(var, str) and var.startswith('FAAS_PROVIDER='):
+                    provider = var.split('=', 1)[1].lower()
+                    # Ensure provider is available
+                    with self._provider_lock:
+                        if provider not in self._provider_factories:
+                            raise FaasException(f"Requested provider '{provider}' not available")
+                    return provider
 
-        if provider:
-            # Ensure provider is available
-            with self._provider_lock:
-                if provider not in self._provider_factories:
-                    raise FaasException(f"Requested provider '{provider}' not available")
-            return provider
-
-        # Default routing logic
-        if task.image and 'nuclio' in self._provider_factories:
-            return 'nuclio'  # Container-based tasks go to Nuclio
+        # Auto-detect from image URI
+        if hasattr(task, 'image') and task.image:
+            if '.dkr.ecr.' in task.image and 'lambda' in self._provider_factories:
+                return 'lambda'
+            elif task.image and 'nuclio' in self._provider_factories:
+                return 'nuclio'
 
         # Default to first available provider
         with self._provider_lock:
@@ -475,8 +502,11 @@ class FaasManager:
             if not isinstance(task, Task):
                 raise TypeError("Decorated function must return a Task object")
 
-            if not hasattr(task, 'provider') or not task.provider:
-                task.provider = provider
+            # Set provider via env var if specified
+            if provider and not any(v.startswith('FAAS_PROVIDER=') for v in (task.env_var or [])):
+                if not task.env_var:
+                    task.env_var = []
+                task.env_var.append(f'FAAS_PROVIDER={provider}')
 
             self.submit(task)
             return task

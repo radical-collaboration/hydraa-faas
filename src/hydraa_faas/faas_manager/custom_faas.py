@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Nuclio provider - Refactored for better HYDRA integration.
+"""Nuclio provider - Simplified resource provisioning.
 
 This module handles Nuclio FaaS deployments on Kubernetes clusters,
-following HYDRA patterns and conventions.
+with automatic resource detection and required registry specification
+for container builds.
 """
 
 import asyncio
@@ -25,9 +26,14 @@ from ..utils.exceptions import DeploymentException, InvocationException, NuclioE
 from ..utils.registry import RegistryManager, RegistryConfig, RegistryType
 from ..utils.resource_manager import ResourceManager
 
+# Python runtime constants
+SUPPORTED_PYTHON_RUNTIMES = ['python:3.9', 'python:3.10', 'python:3.11', 'python:3.12']
+DEFAULT_PYTHON_RUNTIME = 'python:3.9'
+BASE_PYTHON_IMAGES = ['python:3.9', 'python:3.10', 'python:3.11', 'python:3.12']
+
 
 class NuclioProvider:
-    """Nuclio FaaS provider following HYDRA patterns."""
+    """Nuclio FaaS provider with simplified resource provisioning."""
 
     def __init__(self,
                  sandbox: str,
@@ -61,11 +67,11 @@ class NuclioProvider:
         self.auto_terminate = auto_terminate
         self.resource_config = resource_config
 
-        # Registry and resource management
-        self.resource_manager = ResourceManager(logger=self.logger)
+        # Registry manager (no default registry setup)
         self.registry_manager = RegistryManager(logger=self.logger)
+        self.resource_manager = ResourceManager(logger=self.logger)
 
-        # Kubernetes cluster (will be initialized)
+        # Kubernetes cluster (from VMs)
         self.k8s_cluster: Optional[kubernetes.K8sCluster] = None
         self.dashboard_url: Optional[str] = None
         self.dashboard_port = 8070
@@ -103,7 +109,7 @@ class NuclioProvider:
         self.profiler.prof('nuclio_setup_start', uid=self.manager_id)
 
         try:
-            # Initialize Kubernetes cluster using HYDRA's kubernetes module
+            # Initialize Kubernetes cluster from VMs
             self._setup_kubernetes()
 
             # Install Nuclio with retry logic
@@ -112,8 +118,7 @@ class NuclioProvider:
             # Setup dashboard access with async check
             self._setup_dashboard_access()
 
-            # Configure registry
-            self._configure_registry()
+            # No default registry configuration - determined per task
 
             self.profiler.prof('nuclio_setup_end', uid=self.manager_id)
             self.logger.trace("Nuclio environment ready")
@@ -126,7 +131,7 @@ class NuclioProvider:
         """Initialize Kubernetes cluster using HYDRA patterns."""
         self.logger.trace("Initializing Kubernetes cluster for Nuclio")
 
-        # Use HYDRA's kubernetes module
+        # Use HYDRA's kubernetes module with VMs as source of truth
         self.k8s_cluster = kubernetes.K8sCluster(
             run_id=f"nuclio-{self.manager_id}",
             vms=self.vms,
@@ -257,23 +262,6 @@ class NuclioProvider:
         finally:
             loop.close()
 
-    def _configure_registry(self) -> None:
-        """Configure container registry for Nuclio."""
-        reg_config = self.resource_config.get('registry', {})
-
-        if reg_config.get('url'):
-            config = RegistryConfig(
-                type=RegistryType(reg_config.get('type', 'custom')),
-                url=reg_config['url'],
-                username=reg_config.get('username'),
-                password=reg_config.get('password')
-            )
-            self.registry_manager.configure_registry('nuclio_registry', config)
-            self.logger.trace(f"Configured registry: {config.url}")
-        else:
-            # Use local registry by default
-            self.logger.trace("Using local Docker registry")
-
     def _worker(self) -> None:
         """Worker thread for async processing."""
         while not self._terminate.is_set():
@@ -301,14 +289,15 @@ class NuclioProvider:
             # Extract configuration
             faas_config = self._extract_faas_config(task)
 
-            # Validate configuration
-            self._validate_faas_config(faas_config)
-
             # Generate function name
             function_name = self._generate_function_name(task)
 
-            # Build container image
-            image_uri = self._build_image(task, function_name, faas_config)
+            # Determine deployment type automatically
+            deployment_type = self._determine_deployment_type(task, faas_config)
+            self.logger.trace(f"Auto-detected deployment type: {deployment_type} for task {task.id}")
+
+            # Build or get container image
+            image_uri = self._prepare_image(task, function_name, deployment_type, faas_config)
 
             # Deploy to Nuclio
             self._deploy_to_nuclio(task, function_name, image_uri, faas_config)
@@ -318,7 +307,8 @@ class NuclioProvider:
                 self._functions[function_name] = {
                     'task_id': str(task.id),
                     'image_uri': image_uri,
-                    'original_name': task.name or f"task-{task.id}"
+                    'original_name': task.name or f"task-{task.id}",
+                    'deployment_type': deployment_type
                 }
 
             self.profiler.prof('nuclio_deploy_end', uid=str(task.id))
@@ -341,25 +331,31 @@ class NuclioProvider:
                     if key.startswith('FAAS_'):
                         config[key.replace('FAAS_', '').lower()] = value
 
-        # Defaults
-        config.setdefault('handler', 'main:handler')
-        config.setdefault('runtime', 'python:3.9')
-        config.setdefault('source', '')
-
         return config
 
-    def _validate_faas_config(self, config: Dict[str, Any]) -> None:
-        """Validate FaaS configuration."""
-        # Validate handler format
-        handler = config.get('handler', '')
-        if not handler or ':' not in handler:
-            raise DeploymentException(f"Invalid handler format: {handler}. Expected 'module:function'")
+    def _extract_granular_config(self, task: Task) -> Dict[str, Any]:
+        """Extract granular Nuclio configuration from env vars."""
+        granular = {}
 
-        # Validate runtime
-        runtime = config.get('runtime', '')
-        valid_runtimes = ['python:3.9', 'python:3.10', 'python:3.11', 'golang:1.19']
-        if not any(runtime.startswith(r) for r in valid_runtimes):
-            raise DeploymentException(f"Invalid runtime: {runtime}")
+        if task.env_var:
+            for var in task.env_var:
+                if isinstance(var, str) and '=' in var:
+                    key, value = var.split('=', 1)
+                    if key.startswith('FAAS_') and key not in ['FAAS_PROVIDER', 'FAAS_SOURCE',
+                                                               'FAAS_HANDLER', 'FAAS_RUNTIME',
+                                                               'FAAS_TIMEOUT', 'FAAS_REGISTRY_URI']:
+                        # These are granular configs
+                        config_key = key.replace('FAAS_', '').lower()
+                        try:
+                            # Try to parse JSON strings
+                            if value.startswith('{') or value.startswith('['):
+                                granular[config_key] = json.loads(value)
+                            else:
+                                granular[config_key] = value
+                        except json.JSONDecodeError:
+                            granular[config_key] = value
+
+        return granular
 
     def _generate_function_name(self, task: Task) -> str:
         """Generate Nuclio-compatible function name."""
@@ -368,68 +364,179 @@ class NuclioProvider:
         clean_name = ''.join(c for c in base_name.lower() if c.isalnum() or c == '-')
         return f"nuclio-{self.manager_id}-{clean_name}"[:63]  # K8s limit
 
-    def _build_image(self, task: Task, function_name: str,
-                     faas_config: Dict[str, Any]) -> str:
-        """Build container image for Nuclio function."""
-        # Check if using pre-built image
-        if task.image and not task.image.startswith('python:'):
-            return task.image
+    def _determine_deployment_type(self, task: Task, faas_config: Dict[str, Any]) -> str:
+        """Automatically determine deployment type from task attributes."""
+        # Check if it's a prebuilt image (full URI)
+        if hasattr(task, 'image') and task.image and self._is_full_image_uri(task.image):
+            return 'prebuilt-image'
 
-        # Build from source
-        source_path = faas_config.get('source', '')
-        if not source_path:
-            # Create from inline code if available
-            if task.cmd and len(task.cmd) > 2 and task.cmd[0] == 'python':
-                source_path = self._create_source_from_task(task)
-            else:
-                raise DeploymentException("No source code provided")
+        # Get source path
+        source_path = faas_config.get('source')
 
-        # Get registry configuration
-        repo_config = self.registry_manager.get_registry_config('nuclio_registry')
-        if repo_config and repo_config.get('url'):
-            repo_uri = repo_config['url']
-        else:
-            # Use local registry
-            repo_uri = "localhost:5000/nuclio"
+        # Has source + image = container build
+        if source_path and hasattr(task, 'image') and task.image:
+            return 'container-build'
 
-        # Build and push image
-        image_uri, _, _ = self.registry_manager.build_and_push_image(
-            source_path=source_path,
-            repository_uri=repo_uri,
-            image_tag=function_name
+        # Check for inline code
+        if task.cmd and len(task.cmd) > 2 and task.cmd[0] == 'python' and task.cmd[1] == '-c':
+            # Inline code = container build (Nuclio doesn't support zip)
+            return 'container-build'
+
+        # Nuclio doesn't support zip deployments
+        if source_path and not (hasattr(task, 'image') and task.image):
+            raise DeploymentException(
+                "Nuclio requires container deployments. Please specify an image for the task."
+            )
+
+        raise DeploymentException(
+            "Cannot determine deployment type. Provide either:\n"
+            "1. image with full URI (prebuilt-image)\n"
+            "2. FAAS_SOURCE + image + FAAS_REGISTRY_URI (container-build)\n"
+            "3. inline code via cmd (container-build with FAAS_REGISTRY_URI)"
         )
 
-        return image_uri
+    def _is_full_image_uri(self, image: str) -> bool:
+        """Check if image is a full URI (not just a base runtime)."""
+        # Base Python runtimes
+        if image in BASE_PYTHON_IMAGES:
+            return False
 
-    def _create_source_from_task(self, task: Task) -> str:
-        """Create source directory from task's inline code."""
+        # Full URIs contain registry/repo:tag
+        return ('/' in image or
+                ':' in image and not image.startswith('python:') or
+                image.startswith(('docker.io/', 'gcr.io/', 'quay.io/')) or
+                '.azurecr.io' in image or
+                'localhost:' in image)
+
+    def _prepare_image(self, task: Task, function_name: str,
+                       deployment_type: str, faas_config: Dict[str, Any]) -> str:
+        """Prepare container image based on deployment type."""
+        if deployment_type == 'prebuilt-image':
+            # Just use the provided image URI
+            self.logger.trace(f"Using prebuilt image: {task.image}")
+            return task.image
+
+        elif deployment_type == 'container-build':
+            # Container build requires registry_uri
+            registry_uri = faas_config.get('registry_uri')
+            if not registry_uri:
+                raise DeploymentException(
+                    "Container build deployment requires 'FAAS_REGISTRY_URI' in env_var. "
+                    "Example: FAAS_REGISTRY_URI=docker.io/myuser/myrepo or "
+                    "FAAS_REGISTRY_URI=localhost:5000/nuclio for local registry"
+                )
+
+            repo_uri = registry_uri
+            self.logger.trace(f"Building image to push to: {repo_uri}")
+
+            # Get or create source
+            source_path = faas_config.get('source')
+
+            # Use inline code if no source path
+            if not source_path and task.cmd and len(task.cmd) > 2:
+                source_path = self._create_source_from_inline_code(task, faas_config)
+
+            if not source_path:
+                raise DeploymentException("Container build requires source path or inline code")
+
+            # Configure registry if needed (for auth)
+            self._configure_registry_if_needed(repo_uri)
+
+            # Build and push image
+            image_uri, _, _ = self.registry_manager.build_and_push_image(
+                source_path=source_path,
+                repository_uri=repo_uri,
+                image_tag=function_name
+            )
+            return image_uri
+
+        else:
+            raise DeploymentException(f"Unsupported deployment type: {deployment_type}")
+
+    def _create_source_from_inline_code(self, task: Task, faas_config: Dict[str, Any]) -> str:
+        """Create temporary source directory from inline code."""
+        if not (task.cmd and len(task.cmd) > 2 and task.cmd[0] == 'python' and task.cmd[1] == '-c'):
+            raise DeploymentException("No inline code found in task.cmd")
+
+        code = task.cmd[2]
         source_dir = os.path.join(self.sandbox, f"task_{task.id}_source")
         os.makedirs(source_dir, exist_ok=True)
 
-        # Extract code from task.cmd
-        code = task.cmd[2] if len(task.cmd) > 2 else ''
-
-        # Create handler file
-        handler_file = os.path.join(source_dir, "handler.py")
+        # Create handler file for Nuclio
+        handler_file = os.path.join(source_dir, "main.py")
         with open(handler_file, 'w') as f:
-            f.write(code)
+            # Ensure the code has a handler function for Nuclio
+            if 'def handler' not in code:
+                # Wrap the code in a handler function
+                f.write("def handler(context, event):\n")
+                indented_code = '\n'.join(f"    {line}" for line in code.split('\n'))
+                f.write(indented_code)
+                f.write("\n    return 'Success'\n")
+            else:
+                # Adjust handler signature for Nuclio if needed
+                code = code.replace('def handler(event, context):', 'def handler(context, event):')
+                f.write(code)
 
         # Create Dockerfile for Nuclio
         dockerfile = os.path.join(source_dir, "Dockerfile")
         with open(dockerfile, 'w') as f:
-            f.write(f"""FROM python:3.9-slim
+            runtime = task.image if hasattr(task, 'image') and task.image else DEFAULT_PYTHON_RUNTIME
+            # Validate runtime
+            if runtime not in BASE_PYTHON_IMAGES:
+                runtime = DEFAULT_PYTHON_RUNTIME
+
+            f.write(f"""FROM {runtime}
 WORKDIR /app
-COPY handler.py .
+COPY main.py .
 RUN pip install nuclio-sdk
-CMD ["python", "handler.py"]
+CMD ["python", "main.py"]
 """)
 
         return source_dir
+
+    def _configure_registry_if_needed(self, registry_uri: str) -> None:
+        """Configure registry authentication if needed."""
+        # Parse registry type from URI
+        if 'docker.io' in registry_uri or registry_uri.startswith('docker.io/'):
+            # Docker Hub - might need auth
+            if hasattr(self, 'docker_credentials'):
+                config = RegistryConfig(
+                    type=RegistryType.DOCKERHUB,
+                    url='https://index.docker.io/v1/',
+                    username=self.docker_credentials.get('username'),
+                    password=self.docker_credentials.get('password')
+                )
+                self.registry_manager.configure_registry('dockerhub', config)
+        elif 'localhost:' in registry_uri:
+            # Local registry - no auth needed
+            config = RegistryConfig(
+                type=RegistryType.LOCAL,
+                url=registry_uri.split('/')[0]
+            )
+            self.registry_manager.configure_registry('local', config)
+        else:
+            # Custom registry
+            config = RegistryConfig(
+                type=RegistryType.CUSTOM,
+                url=registry_uri.split('/')[0]
+            )
+            self.registry_manager.configure_registry('custom', config)
 
     def _deploy_to_nuclio(self, task: Task, function_name: str,
                           image_uri: str, faas_config: Dict[str, Any]) -> None:
         """Deploy function to Nuclio platform."""
         self.logger.trace(f"Deploying to Nuclio: {function_name}")
+
+        # Validate runtime (Python only)
+        runtime = faas_config.get('runtime', DEFAULT_PYTHON_RUNTIME)
+        if not any(runtime.startswith(f'python:{v}') for v in ['3.9', '3.10', '3.11', '3.12']):
+            raise DeploymentException(
+                f"Unsupported runtime: {runtime}. "
+                f"Only Python runtimes are supported: {SUPPORTED_PYTHON_RUNTIMES}"
+            )
+
+        # Extract granular configuration
+        granular_config = self._extract_granular_config(task)
 
         # Build Nuclio function spec
         spec = nuclio.ConfigSpec(
@@ -437,7 +544,7 @@ CMD ["python", "handler.py"]
             config={
                 "spec": {
                     "handler": faas_config.get('handler', 'main:handler'),
-                    "runtime": "python:3.9",
+                    "runtime": "python:3.9",  # Nuclio format
                     "image": image_uri,
                     "resources": {
                         "requests": {
@@ -453,8 +560,56 @@ CMD ["python", "handler.py"]
             }
         )
 
+        # Apply granular configurations
+        spec_config = spec.config["spec"]
+
+        if 'min_replicas' in granular_config:
+            spec_config["minReplicas"] = int(granular_config['min_replicas'])
+
+        if 'max_replicas' in granular_config:
+            spec_config["maxReplicas"] = int(granular_config['max_replicas'])
+
+        if 'target_cpu' in granular_config:
+            spec_config["targetCPU"] = int(granular_config['target_cpu'])
+
+        if 'triggers' in granular_config:
+            spec_config["triggers"] = granular_config['triggers']
+
+        if 'data_bindings' in granular_config:
+            spec_config["dataBindings"] = granular_config['data_bindings']
+
+        if 'service_type' in granular_config:
+            spec_config["serviceType"] = granular_config['service_type']
+
+        if 'annotations' in granular_config:
+            spec_config["annotations"] = granular_config['annotations']
+
+        if 'labels' in granular_config:
+            spec_config["labels"] = granular_config['labels']
+
+        if 'disable_default_http_trigger' in granular_config:
+            spec_config["disableDefaultHTTPTrigger"] = granular_config['disable_default_http_trigger'].lower() == 'true'
+
+        if 'scale_to_zero' in granular_config:
+            spec_config["scaleToZero"] = granular_config['scale_to_zero'].lower() == 'true'
+
+        if 'node_selector' in granular_config:
+            spec_config["nodeSelector"] = granular_config['node_selector']
+
+        if 'priority_class_name' in granular_config:
+            spec_config["priorityClassName"] = granular_config['priority_class_name']
+
+        if 'preemption_policy' in granular_config:
+            spec_config["preemptionPolicy"] = granular_config['preemption_policy']
+
         # Add environment variables
-        if task.env_var:
+        if hasattr(task, '_user_env_vars'):
+            for var in task._user_env_vars:
+                if isinstance(var, str) and '=' in var:
+                    key, value = var.split('=', 1)
+                    spec.set_env(key, value)
+        elif task.env_var:
+            # Fallback if _user_env_vars not set
             for var in task.env_var:
                 if isinstance(var, str) and '=' in var and not var.startswith('FAAS_'):
                     key, value = var.split('=', 1)

@@ -1,135 +1,131 @@
-# -*- coding: utf-8 -*-
-"""A simple example of deploying a zip-based function to AWS Lambda.
-
-This script demonstrates the end-to-end workflow for using the FaaS Manager
-to deploy and invoke a Python function on AWS Lambda.
-
-Prerequisites:
-    - Your AWS credentials must be configured in your environment. The simplest
-      way is to set the following environment variables:
-        export AWS_ACCESS_KEY_ID="YOUR_KEY"
-        export AWS_SECRET_ACCESS_KEY="YOUR_SECRET"
-        export AWS_REGION="us-east-1" # or your preferred region
-    - The `hydraa` library and the FaaS manager modules must be installed.
-
-"""
-
 import os
-import shutil
-import time
-from pathlib import Path
-
-# Import the necessary components from hydraa and the FaaS manager
-from hydraa import Task, proxy
-from hydraa.services import ServiceManager
-from hydraa_faas.faas_manager.manager import FaasManager  # Assuming the manager is in a package
-
-# --- 1. Set up a temporary project directory ---
-# For a real project, this would be your actual source code directory.
-# Here, we create it on the fly to make the example self-contained.
-project_dir = Path("./my_lambda_function")
-project_dir.mkdir(exist_ok=True)
-
-try:
-    # a. Create the Python handler file
-    handler_code = """
-import requests
 import json
+import time
+from hydraa import Task, proxy
+from hydraa_faas.faas_manager.manager import FaasManager
+from hydraa.services.service_manager import ServiceManager
+
+# Enable more detailed logging
+import logging
+
+logging.basicConfig(level=logging.DEBUG)
+
+# Initialize components
+proxy_mgr = proxy(['aws'])
+faas_manager = FaasManager(proxy_mgr, auto_terminate=False)
+
+service_mgr = ServiceManager([faas_manager])
+service_mgr.start_services()
+
+# Create a test source directory with a Dockerfile
+test_source = '/tmp/container_test'
+os.makedirs(test_source, exist_ok=True)
+
+# Create handler.py
+with open(f'{test_source}/handler.py', 'w') as f:
+    f.write("""
+import json
+import os
 
 def handler(event, context):
-    # A simple function that makes an API call and returns a message
-    try:
-        response = requests.get('https://httpbin.org/get', timeout=5)
-        response.raise_for_status() # Raise an exception for bad status codes
+    return {
+        'statusCode': 200,
+        'body': json.dumps({
+            'message': 'Hello from container!',
+            'container_id': os.environ.get('HOSTNAME', 'unknown'),
+            'event': event,
+            'python_version': os.sys.version
+        })
+    }
+""")
 
-        return {
-            'statusCode': 200,
-            'body': json.dumps({
-                'message': 'Successfully called the test API!',
-                'origin_ip': response.json().get('origin')
-            })
-        }
-    except requests.RequestException as e:
-        return {
-            'statusCode': 500,
-            'body': json.dumps({'error': str(e)})
-        }
-"""
-    (project_dir / "handler.py").write_text(handler_code)
+# Create requirements.txt
+with open(f'{test_source}/requirements.txt', 'w') as f:
+    f.write("requests==2.31.0\n")
 
-    # b. Create a requirements.txt file for dependencies
-    (project_dir / "requirements.txt").write_text("requests==2.28.1\n")
+# Create Dockerfile for Lambda
+with open(f'{test_source}/Dockerfile', 'w') as f:
+    f.write("""FROM public.ecr.aws/lambda/python:3.9
 
-    print(f"Created temporary project directory: {project_dir.resolve()}")
+COPY requirements.txt ./
+RUN pip install -r requirements.txt
 
-    # --- 2. Initialize the Hydraa Proxy Manager for AWS ---
-    # This loads the AWS credentials from your environment.
-    print("\nInitializing proxy manager for AWS...")
-    provider_mgr = proxy(['aws'])
+COPY handler.py ./
 
-    # --- 3. Initialize the FaaS Manager ---
-    # For a pure AWS Lambda deployment, we don't need to define any VMs.
-    # We just pass an empty list.
-    print("Initializing FaaS Manager...")
-    faas_mgr = FaasManager(
-        proxy_mgr=provider_mgr,
-        vms=[],  # No VMs needed for Lambda zip deployments
-        asynchronous=False,  # Set to False to wait for deployments to complete
-        auto_terminate=True  # Automatically clean up resources on shutdown
+CMD ["handler.handler"]
+""")
+
+# Let's check the registry configuration after ECR creation
+lambda_provider = faas_manager._get_provider('lambda')['instance']
+
+# Check if ECR repo exists or create it
+print("\n🔍 Checking ECR repository...")
+repo_uri = lambda_provider._create_ecr_repository()
+print(f"ECR Repository URI: {repo_uri}")
+
+# Check registry configurations
+print("\n🔍 Registry configurations:")
+for name, config in lambda_provider.registry_manager._registry_configs.items():
+    print(f"  {name}: {config}")
+
+# Now let's manually test the build and push
+print("\n🏗️ Testing manual build and push...")
+try:
+    image_uri, build_metrics, push_metrics = lambda_provider.registry_manager.build_and_push_image(
+        source_path=test_source,
+        repository_uri=repo_uri,
+        image_tag='test-manual'
     )
+    print(f"✅ Successfully built and pushed: {image_uri}")
+    print(f"   Build time: {build_metrics.build_time_ms:.2f}ms")
+    print(f"   Push time: {push_metrics.push_time_ms:.2f}ms")
+except Exception as e:
+    print(f"❌ Manual build/push failed: {e}")
+    import traceback
 
-    # --- 4. Initialize and Start the Service Manager ---
-    # The ServiceManager orchestrates the lifecycle of other managers.
-    print("Initializing and starting the Service Manager...")
-    service_mgr = ServiceManager([faas_mgr])
-    # The 'start_services' method creates a sandbox and starts the managers.
-    service_mgr.start_services()
+    traceback.print_exc()
 
-    # --- 5. Define a Task for Deployment ---
-    # This task tells the FaaS manager what to deploy.
-    print("\nDefining the deployment task...")
-    deployment_task = Task(name="my-simple-api-caller")
-    # Set attributes after instantiation, as they are not in the constructor
-    deployment_task.provider = "lambda"
-    deployment_task.source_path = str(project_dir.resolve())
-    deployment_task.handler = "handler.handler"
+# Now try the full deployment
+print("\n🚀 Testing full deployment...")
+task = Task(
+    name='container-hello',
+    vcpus=0.5,
+    memory=512,
+    image='python:3.9',
+    env_var=[
+        'FAAS_PROVIDER=lambda',
+        f'FAAS_SOURCE={test_source}',
+        'FAAS_HANDLER=handler.handler',
+        'FAAS_TIMEOUT=30',
+        'CONTAINER_ENV=production'
+    ]
+)
 
-    # --- 6. Submit the Task for Deployment ---
-    print("Submitting the task for deployment to AWS Lambda...")
-    faas_mgr.submit(deployment_task)
+try:
+    faas_manager.submit(task)
+    function_name = task.result()
+    print(f"✅ Deployed: {function_name}")
 
-    # Because we set asynchronous=False, the script will wait here until
-    # the deployment is complete.
+    # Test invocation
+    print("\n📊 Testing container function...")
+    response = faas_manager.invoke(function_name, {'test': 'data'})
+    print(f"Response: {json.dumps(response['payload'], indent=2)}")
+except Exception as e:
+    print(f"❌ Deployment failed: {e}")
+    import traceback
 
-    print("\nDeployment complete!")
-    time.sleep(10)  # Give Lambda a moment to fully initialize the function
+    traceback.print_exc()
 
-    # --- 7. Invoke the Deployed Function ---
-    print("Invoking the deployed function...")
-    try:
-        # The invocation payload can be any JSON-serializable dictionary
-        payload = {"key": "value"}
-        response = faas_mgr.invoke(
-            function_name="my-simple-api-caller",  # Use the original task name
-            payload=payload
-        )
-        print("\n--- Invocation Response ---")
-        print(response)
-        print("---------------------------\n")
-    except Exception as e:
-        print(f"An error occurred during invocation: {e}")
+# Check what images exist locally
+print("\n🐳 Local Docker images:")
+import docker
 
-finally:
-    # --- 8. Shut Down the Service Manager ---
-    # This is a crucial step. If auto_terminate=True, this will delete the
-    # IAM role and the Lambda function from your AWS account.
-    if 'service_mgr' in locals():
-        print("Shutting down the Service Manager and cleaning up resources...")
-        service_mgr.shutdown_services()
-        print("Shutdown complete.")
+docker_client = docker.from_env()
+for image in docker_client.images.list():
+    for tag in image.tags:
+        if 'hydra' in tag or 'ecr' in tag:
+            print(f"  {tag}")
 
-    # Clean up the temporary project directory
-    if project_dir.exists():
-        shutil.rmtree(project_dir)
-        print(f"Removed temporary project directory: {project_dir.resolve()}")
-
+# Cleanup
+input("\nPress Enter to cleanup...")
+service_mgr.shutdown_services()
