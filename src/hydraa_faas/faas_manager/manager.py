@@ -9,11 +9,12 @@ import os
 import queue
 import threading
 import uuid
-from collections import defaultdict
+
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import radical.utils as ru
+
 from hydraa import Task, proxy
 from hydraa.services.caas_manager.utils import misc
 

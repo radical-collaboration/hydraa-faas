@@ -13,12 +13,12 @@ import os
 import queue
 import threading
 import time
-import uuid
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
 import nuclio
-import yaml
+
 from hydraa import Task
 from hydraa.services.caas_manager.kubernetes import kubernetes
 
