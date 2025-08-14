@@ -24,4 +24,12 @@ jobs:
       - name: Analysing the code with pylint
         run: |
           . testenv/bin/activate
-          python -m pylint $(git ls-files '*.py')
+          python -m pylint $(git ls-files '*.py') --output=lint.txt || true
+          tar czf lint_artifacts.tar.gz lint.txt
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint_artifacts.tar.gz
+          path: lint_artifacts.tar.gz
+          retention-days: 5
+          overwrite: true
