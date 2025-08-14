@@ -4,7 +4,7 @@ aiohttp
 boto3
 botocore
 httpx
-nuclio
+nuclio-jupyter
 pyyaml
 
 # dependencies hydraa failed to install
