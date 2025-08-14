@@ -1,0 +1,36 @@
+name: Pylint
+
+on: [ push ]
+
+jobs:
+
+  linting:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dependencies
+        run: |
+          python -m venv testenv
+          . testenv/bin/activate
+          python -m pip install --upgrade pip pylint
+      - name: Analysing the code with pylint
+        run: |
+          . testenv/bin/activate
+          pylint $(git ls-files 'src/*.py') --output=lint_src.txt || true
+          pylint $(git ls-files 'tests/*.py') --output=lint_tests.txt || true
+          tar czf lint_artifacts.tar.gz lint_*.txt
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lint_artifacts.tar.gz
+          path: lint_artifacts.tar.gz
+          retention-days: 5
+          overwrite: true

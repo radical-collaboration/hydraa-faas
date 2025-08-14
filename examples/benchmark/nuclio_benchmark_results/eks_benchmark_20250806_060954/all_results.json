@@ -1,0 +1,18 @@
+{
+  "benchmark_id": "eks_multi_20250806_060954",
+  "timestamp": "2025-08-06T06:09:54.974730",
+  "configurations": [
+    {
+      "config_name": "1-node-4vcpu",
+      "error": "failed to login to aws: 'ACCESS_KEY_ID'"
+    },
+    {
+      "config_name": "2-node-8vcpu",
+      "error": "failed to login to aws: 'ACCESS_KEY_ID'"
+    },
+    {
+      "config_name": "4-node-16vcpu",
+      "error": "failed to login to aws: 'ACCESS_KEY_ID'"
+    }
+  ]
+}

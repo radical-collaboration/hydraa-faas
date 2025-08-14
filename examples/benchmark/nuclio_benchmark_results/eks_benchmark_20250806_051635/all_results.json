@@ -1,0 +1,18 @@
+{
+  "benchmark_id": "eks_multi_20250806_051635",
+  "timestamp": "2025-08-06T05:16:35.876873",
+  "configurations": [
+    {
+      "config_name": "1-node-4vcpu",
+      "error": "EC2/EKS VM requires ['image_id', 'min_count', 'max_count', 'instance_id'] values to be set"
+    },
+    {
+      "config_name": "2-node-8vcpu",
+      "error": "EC2/EKS VM requires ['image_id', 'min_count', 'max_count', 'instance_id'] values to be set"
+    },
+    {
+      "config_name": "4-node-16vcpu",
+      "error": "EC2/EKS VM requires ['image_id', 'min_count', 'max_count', 'instance_id'] values to be set"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+FaaS Manager Benchmark Summary
+==================================================
+
+MANAGER FOOTPRINT:
+  Average CPU Utilization: 34.60%
+  Average Memory Usage: 211.00 MB
+
+RESOURCE PROVISIONING TIMES:
+  Total: 0.269 seconds
+  IAM Role Creation: 0.000 seconds
+  IAM Role Propagation: 0.000 seconds
+  IAM Policy Attachment: 0.000 seconds
+  ECR Repository Creation: 0.000 seconds
+  IAM Min/Max: 0.000 / 0.000 seconds
+  ECR Min/Max: 0.000 / 0.000 seconds
