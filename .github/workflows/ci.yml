@@ -1,4 +1,4 @@
-name: CI & Black
+name: Tests
 
 on:
   push:
