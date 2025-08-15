@@ -84,6 +84,7 @@ class NuclioProvider:
         self.dashboard_url: Optional[str] = None
         self.dashboard_port = 8070
         self._port_forward_process = None
+        self._using_existing_cluster = False  # Track if we're using an existing cluster
 
         # Function tracking with single lock
         self._functions: Dict[str, Dict[str, Any]] = {}
@@ -147,7 +148,15 @@ class NuclioProvider:
         """Initialize Kubernetes cluster using HYDRA patterns."""
         self.logger.trace("Initializing Kubernetes cluster for Nuclio")
 
-        # Use HYDRA's kubernetes module with VMs as source of truth
+        # Check if we're dealing with AWS/EKS
+        if self.vms and hasattr(self.vms[0], 'Provider') and self.vms[0].Provider == 'aws':
+            if self.vms[0].LaunchType.upper() == 'EKS':
+                # For EKS, use HYDRA's EKSCluster directly
+                self.logger.trace("Detected EKS configuration, using EKSCluster")
+                self._setup_eks_cluster()
+                return
+
+        # Use HYDRA's kubernetes module with VMs as source of truth (for other providers)
         self.k8s_cluster = kubernetes.K8sCluster(
             run_id=f"nuclio-{self.manager_id}",
             vms=self.vms,
@@ -166,9 +175,256 @@ class NuclioProvider:
                 raise DeploymentException("Kubernetes cluster failed to start")
             time.sleep(2)
 
+    def _check_existing_eks_cluster(self, cluster_prefix: str, region: str) -> Optional[str]:
+        """Check if an EKS cluster with the given prefix already exists."""
+        self.logger.trace(f"Checking for existing EKS clusters with prefix: {cluster_prefix} in region: {region}")
+
+        try:
+            import boto3
+            from hydraa.services.caas_manager.utils.misc import sh_callout
+
+            # First try eksctl
+            cmd = f"eksctl get cluster --region {region} -o json"
+            self.logger.trace(f"Running: {cmd}")
+            out, err, ret = sh_callout(cmd, shell=True)
+
+            if ret == 0 and out:
+                self.logger.trace(f"eksctl output: {out[:200]}...")  # Log first 200 chars
+                try:
+                    clusters = json.loads(out)
+                    self.logger.trace(f"Found {len(clusters)} total clusters")
+
+                    for cluster in clusters:
+                        cluster_name = cluster.get('Name', '')
+                        self.logger.trace(f"Checking cluster: {cluster_name}")
+                        if cluster_name.startswith(cluster_prefix):
+                            self.logger.trace(f"Found matching EKS cluster: {cluster_name}")
+                            return cluster_name
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"Failed to parse eksctl output: {e}")
+            else:
+                self.logger.trace(f"eksctl command failed with return code {ret}, stderr: {err}")
+
+            # Also try AWS CLI as fallback
+            cmd2 = f"aws eks list-clusters --region {region}"
+            self.logger.trace(f"Trying AWS CLI: {cmd2}")
+            out2, err2, ret2 = sh_callout(cmd2, shell=True)
+
+            if ret2 == 0 and out2:
+                try:
+                    data = json.loads(out2)
+                    clusters = data.get('clusters', [])
+                    self.logger.trace(f"AWS CLI found {len(clusters)} clusters: {clusters}")
+
+                    for cluster_name in clusters:
+                        if cluster_name.startswith(cluster_prefix):
+                            self.logger.trace(f"Found matching EKS cluster via AWS CLI: {cluster_name}")
+                            return cluster_name
+                except json.JSONDecodeError as e:
+                    self.logger.error(f"Failed to parse AWS CLI output: {e}")
+
+        except Exception as e:
+            self.logger.error(f"Error checking for existing clusters: {e}")
+            import traceback
+            self.logger.trace(traceback.format_exc())
+
+        self.logger.trace("No existing EKS clusters found")
+        return None
+
+    def _setup_eks_cluster(self) -> None:
+        """Set up EKS cluster using HYDRA's EKSCluster class."""
+        self.logger.trace("Setting up EKS cluster for Nuclio")
+
+        # Import EC2 client creation
+        import boto3
+        from hydraa.services.caas_manager.kubernetes import kubernetes
+
+        # Get AWS credentials from the first VM
+        region = self.vms[0].Region if hasattr(self.vms[0], 'Region') else 'us-east-1'
+
+        # Check for environment variable first
+        env_cluster_name = os.environ.get('NUCLIO_EKS_CLUSTER_NAME', '')
+        if env_cluster_name:
+            self.logger.trace(f"Using cluster specified by environment variable: {env_cluster_name}")
+            existing_cluster = env_cluster_name
+        else:
+            # Check for existing cluster
+            cluster_prefix = "h-aws-eks-cluster-"
+            existing_cluster = self._check_existing_eks_cluster(cluster_prefix, region)
+
+        if existing_cluster:
+            self.logger.trace(f"Attempting to use existing EKS cluster: {existing_cluster}")
+
+            # Create EC2 client (required by EKSCluster)
+            ec2_client = boto3.client('ec2', region_name=region)
+
+            # Use HYDRA's EKSCluster with existing cluster
+            self.k8s_cluster = kubernetes.EKSCluster(
+                run_id=f"nuclio-{self.manager_id}",
+                sandbox=self.sandbox,
+                vms=self.vms,
+                ec2=ec2_client,
+                log=self.logger
+            )
+
+            # Set the cluster name to the existing one
+            self.k8s_cluster.cluster_name = existing_cluster
+            self.k8s_cluster.name = existing_cluster
+            self.k8s_cluster.status = 'RUNNING'
+
+            # Mark that we're using an existing cluster (don't delete it later)
+            self._using_existing_cluster = True
+
+            # Update kubeconfig for the existing cluster
+            from hydraa.services.caas_manager.utils.misc import sh_callout
+
+            # Set KUBECONFIG environment variable to avoid conflicts
+            kubeconfig_path = os.path.join(self.sandbox, "kubeconfig")
+            os.environ['KUBECONFIG'] = kubeconfig_path
+
+            cmd = f"eksctl utils write-kubeconfig --cluster={existing_cluster} --region={region} --kubeconfig={kubeconfig_path}"
+            self.logger.trace(f"Updating kubeconfig: {cmd}")
+            out, err, ret = sh_callout(cmd, shell=True)
+
+            if ret != 0:
+                self.logger.warning(f"Failed to update kubeconfig with eksctl: {err}")
+                # Try alternative method
+                cmd2 = f"aws eks update-kubeconfig --name {existing_cluster} --region {region} --kubeconfig {kubeconfig_path}"
+                self.logger.trace(f"Trying alternative: {cmd2}")
+                out2, err2, ret2 = sh_callout(cmd2, shell=True)
+
+                if ret2 != 0:
+                    self.logger.error(f"Both kubeconfig update methods failed")
+                    raise DeploymentException(f"Cannot connect to existing cluster {existing_cluster}")
+
+            # Set kubeconfig for the k8s_cluster object
+            self.k8s_cluster.kubeconfig = kubeconfig_path
+
+            self.logger.trace("Successfully connected to existing EKS cluster")
+
+            # Verify cluster is accessible
+            if not self._verify_cluster_access():
+                self.logger.error("Cannot access existing cluster")
+                raise DeploymentException(f"Cannot access existing cluster {existing_cluster}")
+        else:
+            self._using_existing_cluster = False
+            self._create_new_eks_cluster(region)
+
+    def _create_new_eks_cluster(self, region: str) -> None:
+        """Create a new EKS cluster."""
+        self.logger.trace("Creating new EKS cluster (this will take 10-15 minutes)...")
+
+        import boto3
+        from hydraa.services.caas_manager.kubernetes import kubernetes
+
+        # Create EC2 client (required by EKSCluster)
+        ec2_client = boto3.client('ec2', region_name=region)
+
+        # Use HYDRA's EKSCluster directly
+        self.k8s_cluster = kubernetes.EKSCluster(
+            run_id=f"nuclio-{self.manager_id}",
+            sandbox=self.sandbox,
+            vms=self.vms,
+            ec2=ec2_client,
+            log=self.logger
+        )
+
+        # Bootstrap the EKS cluster
+        self.k8s_cluster.bootstrap()
+
+        # Wait for cluster to be ready with proper timeout
+        timeout = 1200  # 20 minutes for EKS
+        start_time = time.time()
+        last_log_time = start_time
+
+        while self.k8s_cluster.status != 'RUNNING':
+            elapsed = time.time() - start_time
+
+            # Log progress every 30 seconds
+            if time.time() - last_log_time > 30:
+                self.logger.trace(f"Waiting for EKS cluster... ({int(elapsed)}s elapsed)")
+                last_log_time = time.time()
+
+            if elapsed > timeout:
+                raise DeploymentException(f"EKS cluster failed to start after {timeout / 60} minutes")
+
+            time.sleep(10)  # Check every 10 seconds
+
+        self.logger.trace(f"EKS cluster is ready (took {int(time.time() - start_time)}s)")
+
+        # Additional verification
+        if not self._verify_cluster_access():
+            raise DeploymentException("EKS cluster created but cannot access it")
+
+    def _verify_cluster_access(self) -> bool:
+        """Verify that kubectl can access the cluster."""
+        try:
+            from hydraa.services.caas_manager.utils.misc import sh_callout
+
+            # Try to get nodes
+            cmd = "kubectl get nodes -o json"
+            out, err, ret = sh_callout(cmd, shell=True, kube=self.k8s_cluster)
+
+            if ret == 0 and out:
+                nodes_data = json.loads(out)
+                if nodes_data.get('items'):
+                    self.logger.trace(f"Cluster has {len(nodes_data['items'])} nodes")
+                    return True
+        except Exception as e:
+            self.logger.error(f"Failed to verify cluster access: {e}")
+
+        return False
+
+    def _wait_for_cluster_ready(self, timeout: int = 300) -> None:
+        """Wait for cluster nodes to be ready."""
+        self.logger.trace("Waiting for cluster nodes to be ready...")
+        from hydraa.services.caas_manager.utils.misc import sh_callout
+
+        start_time = time.time()
+
+        while time.time() - start_time < timeout:
+            cmd = "kubectl get nodes -o json"
+            out, err, ret = sh_callout(cmd, shell=True, kube=self.k8s_cluster)
+
+            if ret == 0 and out:
+                try:
+                    nodes_data = json.loads(out)
+                    nodes = nodes_data.get('items', [])
+
+                    if nodes:
+                        all_ready = True
+                        for node in nodes:
+                            conditions = node.get('status', {}).get('conditions', [])
+                            ready_condition = next((c for c in conditions if c['type'] == 'Ready'), None)
+                            if not ready_condition or ready_condition['status'] != 'True':
+                                all_ready = False
+                                break
+
+                        if all_ready:
+                            self.logger.trace(f"All {len(nodes)} nodes are ready")
+                            return
+                        else:
+                            self.logger.trace(
+                                f"Waiting for nodes to be ready ({len([n for n in nodes if self._is_node_ready(n)])}/{len(nodes)} ready)")
+                except json.JSONDecodeError:
+                    pass
+
+            time.sleep(10)
+
+        raise DeploymentException(f"Cluster nodes failed to become ready after {timeout}s")
+
+    def _is_node_ready(self, node: Dict[str, Any]) -> bool:
+        """Check if a node is ready."""
+        conditions = node.get('status', {}).get('conditions', [])
+        ready_condition = next((c for c in conditions if c['type'] == 'Ready'), None)
+        return ready_condition and ready_condition['status'] == 'True'
+
     def _install_nuclio(self, max_retries: int = 3) -> None:
         """Install Nuclio on the Kubernetes cluster with retry logic."""
         self.logger.trace("Installing Nuclio")
+
+        # Wait for nodes to be ready first
+        self._wait_for_cluster_ready()
 
         install_commands = [
             "kubectl create namespace nuclio",
@@ -204,8 +460,9 @@ class NuclioProvider:
 
         from hydraa.services.caas_manager.utils.misc import sh_callout
 
-        timeout = 120
+        timeout = 300  # 5 minutes for Nuclio
         start_time = time.time()
+        last_log_time = start_time
 
         while time.time() - start_time < timeout:
             cmd = "kubectl get pods -n nuclio -o json"
@@ -214,13 +471,22 @@ class NuclioProvider:
             if not ret:
                 try:
                     pods_data = json.loads(out)
-                    all_ready = all(
-                        pod['status']['phase'] == 'Running'
-                        for pod in pods_data.get('items', [])
-                    )
-                    if all_ready and pods_data.get('items'):
-                        self.logger.trace("Nuclio is ready")
-                        return
+                    pods = pods_data.get('items', [])
+
+                    if pods:
+                        ready_pods = sum(1 for pod in pods if pod['status']['phase'] == 'Running')
+                        total_pods = len(pods)
+
+                        # Log progress every 10 seconds
+                        if time.time() - last_log_time > 10:
+                            self.logger.trace(f"Nuclio pods: {ready_pods}/{total_pods} ready")
+                            last_log_time = time.time()
+
+                        if ready_pods == total_pods:
+                            self.logger.trace("All Nuclio pods are ready")
+                            # Give it a bit more time to fully initialize
+                            time.sleep(10)
+                            return
                 except json.JSONDecodeError:
                     pass
 
@@ -228,7 +494,7 @@ class NuclioProvider:
 
         raise DeploymentException("Nuclio failed to become ready")
 
-    async def _check_dashboard_async(self, timeout: int = 30) -> bool:
+    async def _check_dashboard_async(self, timeout: int = 60) -> bool:
         """Asynchronously check if Nuclio dashboard is accessible."""
         start_time = time.time()
 
@@ -244,7 +510,7 @@ class NuclioProvider:
                 except:
                     pass
 
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
 
         return False
 
@@ -273,7 +539,8 @@ class NuclioProvider:
                 self.dashboard_url = f"http://localhost:{self.dashboard_port}"
                 self.logger.trace(f"Nuclio dashboard available at {self.dashboard_url}")
             else:
-                raise DeploymentException("Nuclio dashboard failed to become accessible")
+                self.logger.warning("Nuclio dashboard not accessible, continuing anyway")
+                self.dashboard_url = f"http://localhost:{self.dashboard_port}"
         finally:
             loop.close()
 
@@ -344,45 +611,6 @@ class NuclioProvider:
                 self.profiler.prof('nuclio_deploy_failed', uid=str(task.id))
             raise DeploymentException(f"Nuclio deployment failed: {e}")
 
-    def deploy_batch_optimized(self, tasks: List[Task]) -> List[str]:
-        """Deploy multiple functions in parallel with optimizations."""
-        if self.enable_metrics:
-            self.profiler.prof('nuclio_batch_start', uid=self.manager_id)
-
-        # Group tasks by deployment type
-        tasks_by_type = {}
-        for task in tasks:
-            faas_config = self._extract_faas_config(task)
-            dep_type = self._determine_deployment_type(task, faas_config)
-            tasks_by_type.setdefault(dep_type, []).append(task)
-
-        results = []
-        all_futures = {}
-
-        # Deploy groups in parallel
-        for dep_type, task_group in tasks_by_type.items():
-            for task in task_group:
-                future = self.deployment_executor.submit(
-                    self.deploy_function,
-                    task
-                )
-                all_futures[future] = task
-
-        # Collect results
-        for future in as_completed(all_futures):
-            task = all_futures[future]
-            try:
-                function_name = future.result()
-                results.append(function_name)
-                task.set_result(function_name)
-            except Exception as e:
-                self.logger.error(f"Failed to deploy task {task.id}: {e}")
-                task.set_exception(e)
-
-        if self.enable_metrics:
-            self.profiler.prof('nuclio_batch_end', uid=self.manager_id)
-        return results
-
     def _extract_faas_config(self, task: Task) -> Dict[str, Any]:
         """Extract FaaS configuration from Task's env_var."""
         config = {}
@@ -395,45 +623,6 @@ class NuclioProvider:
                         config[key.replace('FAAS_', '').lower()] = value
 
         return config
-
-    def _extract_granular_config(self, task: Task) -> Dict[str, Any]:
-        """Extract granular Nuclio configuration from env vars."""
-        granular = {}
-
-        if task.env_var:
-            for var in task.env_var:
-                if isinstance(var, str) and '=' in var:
-                    key, value = var.split('=', 1)
-                    if key.startswith('FAAS_') and key not in ['FAAS_PROVIDER', 'FAAS_SOURCE',
-                                                               'FAAS_HANDLER', 'FAAS_RUNTIME',
-                                                               'FAAS_TIMEOUT', 'FAAS_REGISTRY_URI',
-                                                               'FAAS_INLINE_CODE']:
-                        # These are granular configs
-                        config_key = key.replace('FAAS_', '').lower()
-                        try:
-                            # Try to parse JSON strings
-                            if value.startswith('{') or value.startswith('['):
-                                granular[config_key] = json.loads(value)
-                            else:
-                                granular[config_key] = value
-                        except json.JSONDecodeError:
-                            granular[config_key] = value
-
-        return granular
-
-    def _extract_nuclio_build_config(self, task: Task) -> Dict[str, Any]:
-        """Extract Nuclio-specific build configuration from task."""
-        build_config = {}
-
-        # Use cmd for Nuclio build commands
-        if hasattr(task, 'cmd') and task.cmd:
-            build_config['build_commands'] = task.cmd
-
-        # Extract other Nuclio-specific configs from env vars
-        granular_config = self._extract_granular_config(task)
-        build_config.update(granular_config)
-
-        return build_config
 
     def _generate_function_name(self, task: Task) -> str:
         """Generate Nuclio-compatible function name."""
@@ -467,16 +656,13 @@ class NuclioProvider:
 
     def _is_full_image_uri(self, image: str) -> bool:
         """Check if image is a full URI (not just a base runtime)."""
-        # Base Python runtimes
         if image in BASE_PYTHON_IMAGES:
             return False
 
-        # Full URIs contain registry/repo:tag
         return ('/' in image or
                 ':' in image and not image.startswith('python:') or
-                image.startswith(('docker.io/', 'gcr.io/', 'quay.io/')) or
-                '.azurecr.io' in image or
-                'localhost:' in image)
+                '.amazonaws.com' in image or
+                '.azurecr.io' in image)
 
     def _deploy_prebuilt_image(self, task: Task, function_name: str, faas_config: Dict[str, Any]) -> None:
         """Deploy a function with a prebuilt container image."""
@@ -496,12 +682,13 @@ class NuclioProvider:
             raise DeploymentException(f"Source path does not exist: {source_path}")
 
         # Registry URI is required for source builds
+        # Format: docker.io/username or 123456.dkr.ecr.region.amazonaws.com/repo
         registry_uri = faas_config.get('registry_uri')
         if not registry_uri:
             raise DeploymentException(
                 "Source build deployment requires 'FAAS_REGISTRY_URI' in env_var. "
-                "Example: FAAS_REGISTRY_URI=docker.io/myuser/myrepo or "
-                "FAAS_REGISTRY_URI=localhost:5000/nuclio"
+                "Example: FAAS_REGISTRY_URI=docker.io/myuser or "
+                "FAAS_REGISTRY_URI=946358504676.dkr.ecr.us-east-1.amazonaws.com/hydra-faas"
             )
 
         self.logger.trace(f"Building from source: {source_path} to registry: {registry_uri}")
@@ -565,11 +752,12 @@ class NuclioProvider:
     def _create_function_yaml(self, task: Task, function_name: str, faas_config: Dict[str, Any],
                               source_path: str, registry_uri: str) -> str:
         """Create function.yaml for nuctl build."""
-        yaml_path = os.path.join(self.sandbox, f"{function_name}_function.yaml")
+        # Create the function.yaml in a separate directory, not in the source directory
+        yaml_dir = os.path.join(self.sandbox, f"{function_name}_build")
+        os.makedirs(yaml_dir, exist_ok=True)
+        yaml_path = os.path.join(yaml_dir, "function.yaml")
 
         # Build configuration
-        build_config = self._extract_nuclio_build_config(task)
-
         function_config = {
             "apiVersion": "nuclio.io/v1",
             "kind": "NuclioFunction",
@@ -581,8 +769,9 @@ class NuclioProvider:
                 "handler": faas_config.get('handler', 'main:handler'),
                 "runtime": faas_config.get('runtime', DEFAULT_PYTHON_RUNTIME),
                 "build": {
-                    "path": source_path,
-                    "registry": registry_uri,
+                    "path": source_path,  # Absolute path to source
+                    "registry": registry_uri,  # Full registry path
+                    "image": f"{registry_uri}/{function_name}:latest",  # Full image name
                     "noBaseImagesPull": True
                 },
                 "resources": {
@@ -602,9 +791,9 @@ class NuclioProvider:
         if hasattr(task, 'image') and task.image and task.image in BASE_PYTHON_IMAGES:
             function_config["spec"]["build"]["baseImage"] = task.image
 
-        # Add build commands if specified
-        if build_config.get('build_commands'):
-            function_config["spec"]["build"]["commands"] = build_config['build_commands']
+        # Add build commands if specified (from task.cmd)
+        if hasattr(task, 'cmd') and task.cmd:
+            function_config["spec"]["build"]["commands"] = task.cmd if isinstance(task.cmd, list) else [task.cmd]
 
         # Add environment variables
         if hasattr(task, '_user_env_vars') and task._user_env_vars:
@@ -625,7 +814,11 @@ class NuclioProvider:
         """Build function using nuctl."""
         from hydraa.services.caas_manager.utils.misc import sh_callout
 
-        cmd = f"nuctl build {function_name} --path {function_yaml_path} --registry {registry_uri} --platform kube"
+        # Get the directory containing function.yaml
+        yaml_dir = os.path.dirname(function_yaml_path)
+
+        # nuctl build expects --path to point to directory containing function.yaml
+        cmd = f"nuctl build {function_name} --path {yaml_dir} --platform kube"
 
         self.logger.trace(f"Building function with nuctl: {cmd}")
         out, err, ret = sh_callout(cmd, shell=True)
@@ -639,7 +832,10 @@ class NuclioProvider:
         """Deploy function using nuctl."""
         from hydraa.services.caas_manager.utils.misc import sh_callout
 
-        cmd = f"nuctl deploy {function_name} --path {function_yaml_path} --platform kube"
+        # Get the directory containing function.yaml
+        yaml_dir = os.path.dirname(function_yaml_path)
+
+        cmd = f"nuctl deploy {function_name} --path {yaml_dir} --platform kube"
 
         self.logger.trace(f"Deploying function with nuctl: {cmd}")
         out, err, ret = sh_callout(cmd, shell=True)
@@ -651,9 +847,6 @@ class NuclioProvider:
 
     def _build_nuclio_spec(self, task: Task, function_name: str, faas_config: Dict[str, Any]) -> nuclio.ConfigSpec:
         """Build base Nuclio configuration spec."""
-        # Extract granular configuration
-        granular_config = self._extract_granular_config(task)
-
         # Build Nuclio function spec
         spec = nuclio.ConfigSpec(
             env=[],
@@ -674,18 +867,6 @@ class NuclioProvider:
                 }
             }
         )
-
-        # Apply granular configurations
-        spec_config = spec.config["spec"]
-
-        if 'min_replicas' in granular_config:
-            spec_config["minReplicas"] = int(granular_config['min_replicas'])
-
-        if 'max_replicas' in granular_config:
-            spec_config["maxReplicas"] = int(granular_config['max_replicas'])
-
-        if 'target_cpu' in granular_config:
-            spec_config["targetCPU"] = int(granular_config['target_cpu'])
 
         # Add environment variables
         if hasattr(task, '_user_env_vars'):
@@ -800,9 +981,16 @@ class NuclioProvider:
                 except Exception as e:
                     self.logger.error(f"Failed to delete {name}: {e}")
 
-            # Shutdown Kubernetes cluster
-            if self.k8s_cluster:
-                self.k8s_cluster.shutdown()
+            # Only shutdown Kubernetes cluster if we created it
+            if self.k8s_cluster and not self._using_existing_cluster:
+                # Check if it's an EKS cluster
+                if hasattr(self.k8s_cluster, '__class__') and 'EKSCluster' in str(self.k8s_cluster.__class__):
+                    self.logger.trace("Shutting down EKS cluster")
+                    self.k8s_cluster.shutdown()
+                elif hasattr(self.k8s_cluster, 'shutdown'):
+                    self.k8s_cluster.shutdown()
+            elif self._using_existing_cluster:
+                self.logger.trace("Using existing cluster - not deleting it")
 
         # Stop port forwarding
         if self._port_forward_process:

@@ -469,15 +469,17 @@ class MetricsCollector:
         df = pd.DataFrame([asdict(i) for i in completed])
         cold_start_percentage = (df['cold_start'].sum() / len(df)) * 100
 
-        summary = df.agg(
-            count=('invocation_id', 'count'),
-            avg_total_ms=('total_time_ms', 'mean'),
-            p90_total_ms=('total_time_ms', lambda x: x.quantile(0.9)),
-            avg_overhead_ms=('manager_overhead_ms', 'mean'),
-            avg_makespan_ms=('makespan_ms', 'mean'),
-            avg_network_delay_ms=('network_delay_ms', 'mean')
-        ).to_frame().T
-        summary['cold_start_percentage'] = cold_start_percentage
+        # Fix the aggregation - result is already a Series, not a DataFrame
+        summary = pd.DataFrame({
+            'count': [len(df)],
+            'avg_total_ms': [df['total_time_ms'].mean()],
+            'p90_total_ms': [df['total_time_ms'].quantile(0.9)],
+            'avg_overhead_ms': [df['manager_overhead_ms'].mean()],
+            'avg_makespan_ms': [df['makespan_ms'].mean()],
+            'avg_network_delay_ms': [df['network_delay_ms'].mean()],
+            'cold_start_percentage': [cold_start_percentage]
+        })
+
         return summary
 
     def save_results(self, filename: str = "benchmark_results.json") -> Path:

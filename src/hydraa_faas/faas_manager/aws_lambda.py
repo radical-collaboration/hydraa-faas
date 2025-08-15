@@ -83,6 +83,7 @@ class AwsLambda:
                  profiler: Any,
                  deployment_workers: int = 200,
                  invocation_workers: int = 50,
+                 packaging_workers: int = 50,
                  enable_metrics: bool = True):
         """Initialize AWS Lambda provider.
 
@@ -97,6 +98,7 @@ class AwsLambda:
             profiler: HYDRA profiler instance.
             deployment_workers: Max workers for deployment operations.
             invocation_workers: Max workers for invocation operations.
+            packaging_workers: Max workers for packaging operations.
             enable_metrics: Whether to collect performance metrics.
         """
         self.sandbox = sandbox
@@ -148,7 +150,7 @@ class AwsLambda:
         self.incoming_q = queue.Queue()
         self._terminate = threading.Event()
 
-        # Separate thread pools for deployments and invocations
+        # Separate thread pools for deployments, invocations, and packaging
         self.deployment_executor = ThreadPoolExecutor(
             max_workers=deployment_workers,
             thread_name_prefix="Lambda_Deploy"
@@ -158,6 +160,17 @@ class AwsLambda:
             max_workers=invocation_workers,
             thread_name_prefix="Lambda_Invoke"
         )
+
+        # New packaging executor for async package creation
+        self.packaging_executor = ThreadPoolExecutor(
+            max_workers=packaging_workers,
+            thread_name_prefix="Lambda_Package"
+        )
+
+        # Packaging queue for managing packaging requests
+        self.packaging_queue = queue.Queue()
+        self._packaging_futures = {}
+        self._packaging_lock = threading.Lock()
 
         # IAM role (always created/reused, never user-provided)
         self._iam_role_arn = None
@@ -286,8 +299,14 @@ class AwsLambda:
             deployment_type = self._determine_deployment_type(task, faas_config)
             self.logger.trace(f"Auto-detected deployment type: {deployment_type} for task {task.id}")
 
-            # Create deployment package based on type
-            package_content = self._create_package(task, deployment_type, faas_config)
+            # Create deployment package asynchronously
+            package_future = self._create_package_async(task, deployment_type, faas_config)
+
+            # While package is being created, we can do other preparations
+            # This runs in parallel with packaging
+
+            # Wait for package to be ready
+            package_content = package_future.result()
 
             # Deploy to Lambda
             function_arn = self._deploy_to_lambda(
@@ -343,11 +362,18 @@ class AwsLambda:
         # Process each group with type-specific optimizations
         for (dep_type, base_image), task_group in tasks_by_type_and_image.items():
             if dep_type == 'zip':
-                # Parallelize packaging
+                # Submit packaging jobs first, then deployment
+                packaging_futures = []
                 for task, faas_config in task_group:
+                    # Start async packaging
+                    pkg_future = self._create_package_async(task, dep_type, faas_config)
+                    packaging_futures.append((task, faas_config, dep_type, pkg_future))
+
+                # As packages complete, submit deployments
+                for task, faas_config, dep_type, pkg_future in packaging_futures:
                     future = self.deployment_executor.submit(
-                        self._deploy_single_function,
-                        task, faas_config, dep_type
+                        self._deploy_with_package_future,
+                        task, faas_config, dep_type, pkg_future
                     )
                     all_futures[future] = task
 
@@ -398,10 +424,43 @@ class AwsLambda:
             self.profiler.prof('lambda_batch_end', uid=self.manager_id)
         return results
 
+    def _create_package_async(self, task: Task, deployment_type: str, faas_config: Dict[str, Any]) -> Any:
+        """Create deployment package asynchronously."""
+        # Submit packaging to the packaging executor
+        future = self.packaging_executor.submit(
+            self._create_package, task, deployment_type, faas_config
+        )
+        return future
+
+    def _deploy_with_package_future(self, task: Task, faas_config: Dict[str, Any],
+                                    dep_type: str, package_future: Any) -> str:
+        """Deploy a function after its package is ready."""
+        function_name = self._generate_function_name(task)
+
+        # Wait for package to be ready
+        package = package_future.result()
+
+        function_arn = self._deploy_to_lambda(
+            task, function_name, package, dep_type, faas_config
+        )
+
+        # Track deployment
+        with self._provider_lock:
+            self._functions[function_name] = {
+                'arn': function_arn,
+                'task_id': str(task.id),
+                'deployment_type': dep_type
+            }
+
+        return function_name
+
     def _deploy_single_function(self, task: Task, faas_config: Dict[str, Any], dep_type: str) -> str:
         """Deploy a single function - helper for parallel deployment."""
         function_name = self._generate_function_name(task)
-        package = self._create_package(task, dep_type, faas_config)
+
+        # Create package asynchronously
+        package_future = self._create_package_async(task, dep_type, faas_config)
+        package = package_future.result()
 
         function_arn = self._deploy_to_lambda(
             task, function_name, package, dep_type, faas_config
@@ -580,7 +639,7 @@ class AwsLambda:
                 self.logger.warning(f"Handler validation failed: {e}")
                 # Continue anyway - the handler might be generated during packaging
 
-            # Create zip package
+            # Create zip package using optimized packaging
             zip_content, _, _ = create_deployment_package(source_path)
             return zip_content
 
@@ -621,7 +680,7 @@ CMD ["handler.handler"]
                           package: Union[bytes, str], deployment_type: str,
                           faas_config: Dict[str, Any]) -> str:
         """Deploy package to AWS Lambda."""
-        # Use Task's vcpus and memory for Lambda configuration
+        # Use Task's memory for Lambda configuration
         memory = max(
             min(int(task.memory or 256), LAMBDA_MAX_MEMORY),
             LAMBDA_MIN_MEMORY
@@ -872,6 +931,7 @@ CMD ["handler.handler"]
         # Shutdown executors
         self.deployment_executor.shutdown(wait=True)
         self.invocation_executor.shutdown(wait=True)
+        self.packaging_executor.shutdown(wait=True)
 
         if self.enable_metrics:
             self.profiler.prof('lambda_shutdown_end', uid=self.manager_id)

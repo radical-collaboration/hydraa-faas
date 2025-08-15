@@ -20,6 +20,7 @@ from hydraa.services.caas_manager.utils import misc
 
 from ..utils.exceptions import FaasException, InvocationException
 from ..utils.metrics_collector import MetricsCollector
+from ..utils import packaging  # Import packaging module for shutdown
 from .aws_lambda import AwsLambda
 from .custom_faas import NuclioProvider
 
@@ -43,6 +44,7 @@ class FaaSManager:
                  auto_terminate: bool = True,
                  deployment_workers: int = 200,
                  invocation_workers: int = 50,
+                 packaging_workers: int = 50,
                  enable_metrics: bool = True,
                  metrics_save_interval: int = 60):
         """Initializes the FaaS Manager with integrated metrics.
@@ -54,6 +56,7 @@ class FaaSManager:
             auto_terminate: If True, cleanup resources on shutdown.
             deployment_workers: Max workers for deployment operations (default 200).
             invocation_workers: Max workers for invocation operations (default 50).
+            packaging_workers: Max workers for packaging operations (default 50).
             enable_metrics: If True, collect performance metrics (default True).
             metrics_save_interval: Interval in seconds to save metrics (default 60).
         """
@@ -63,6 +66,7 @@ class FaaSManager:
         self.auto_terminate = auto_terminate
         self.deployment_workers = deployment_workers
         self.invocation_workers = invocation_workers
+        self.packaging_workers = packaging_workers
         self.enable_metrics = enable_metrics
 
         # HYDRA ServiceManager expectations
@@ -225,6 +229,7 @@ class FaaSManager:
             profiler=self.profiler,
             deployment_workers=self.deployment_workers,
             invocation_workers=self.invocation_workers,
+            packaging_workers=self.packaging_workers,
             enable_metrics=self.enable_metrics
         )
         return {'instance': provider, 'type': 'lambda'}
@@ -363,29 +368,46 @@ class FaaSManager:
         # Don't add default cmd - let it fail if not properly configured
 
         # Map FaaS concepts to Task attributes
-        if not task.vcpus:
-            task.vcpus = 0.25  # Default 256MB Lambda
         if not task.memory:
             task.memory = 256  # Default memory
 
-        # Extract and separate FaaS config from user env vars
+        # Extract and process FaaS config
         faas_config = self._extract_faas_config(task)
 
         # Store processed FaaS config back in env_var for providers
         if not task.env_var:
             task.env_var = []
 
-        # Add back FaaS config
+        # Store user env vars separately
+        user_env_vars = []
+        new_env_var = []
+
+        # Process env vars to separate FaaS config from user vars
+        for var in list(task.env_var):  # Create a copy to iterate over
+            if isinstance(var, str) and '=' in var:
+                key, value = var.split('=', 1)
+                if not key.startswith('FAAS_'):
+                    user_env_vars.append(var)
+                    new_env_var.append(var)
+                # FAAS_ vars are already in faas_config
+            else:
+                new_env_var.append(var)
+
+        # Store user env vars for providers to use
+        task._user_env_vars = user_env_vars
+
+        # Update task env_var to only contain user vars
+        task.env_var = new_env_var
+
+        # Re-add FaaS config to env_var for provider compatibility
         for key, value in faas_config.items():
             task.env_var.append(f"FAAS_{key.upper()}={value}")
 
     def _extract_faas_config(self, task: Task) -> Dict[str, Any]:
         """Extract FaaS configuration from FAAS_* env vars."""
         faas_config = {}
-        user_env_vars = []
 
         if task.env_var:
-            new_env_var = []
             for var in task.env_var:
                 if isinstance(var, str) and '=' in var:
                     key, value = var.split('=', 1)
@@ -393,21 +415,10 @@ class FaaSManager:
                         # FaaS configuration
                         config_key = key.replace('FAAS_', '').lower()
                         faas_config[config_key] = value
-                    else:
-                        # User runtime environment variable
-                        user_env_vars.append(var)
-                        new_env_var.append(var)
-                else:
-                    new_env_var.append(var)
-
-            # Update task env_var to only contain user vars
-            task.env_var = new_env_var
-
-        # Store user env vars for providers to use
-        task._user_env_vars = user_env_vars
 
         # Apply defaults (but not for inline code)
-        faas_config.setdefault('handler', 'handler.handler')
+        if 'handler' not in faas_config and 'inline_code' not in faas_config:
+            faas_config.setdefault('handler', 'handler.handler')
         faas_config.setdefault('runtime', 'python3.9')
         faas_config.setdefault('timeout', '30')
 
@@ -715,6 +726,10 @@ class FaaSManager:
         # Cleanup thread pools
         self.deployment_executor.shutdown(wait=True)
         self.invocation_executor.shutdown(wait=True)
+
+        # Shutdown the global packaging dependency installer
+        packaging.shutdown_packaging()
+
         self.status = False
 
         if self.enable_metrics:
