@@ -196,7 +196,7 @@ class ResourceManager:
             return role_arn
 
     def create_aws_ecr_repository(self, repo_name: str, ecr_client: Any) -> str:
-        """Creates or gets an ECR repository.
+        """Creates or gets an ECR repository with proper permissions.
 
         Args:
             repo_name: The name for the ECR repository.
@@ -217,17 +217,59 @@ class ResourceManager:
                 )
                 repo_uri = response['repository']['repositoryUri']
                 self._log_info(f"Created ECR repository: {repo_name}")
+
+                # Set repository policy to allow Lambda service
+                self._set_ecr_repository_policy(repo_name, ecr_client)
+
             except ClientError as e:
                 if e.response['Error']['Code'] == 'RepositoryAlreadyExistsException':
                     self._log_info(f"Using existing ECR repository: {repo_name}")
                     response = ecr_client.describe_repositories(repositoryNames=[repo_name])
                     repo_uri = response['repositories'][0]['repositoryUri']
+
+                    # Ensure policy is set even for existing repo
+                    self._set_ecr_repository_policy(repo_name, ecr_client)
                 else:
                     raise ECRException(f"Failed to create ECR repository: {e}")
 
             self.aws_resources.ecr_repository_uri = repo_uri
             self.aws_resources.ecr_repository_name = repo_name
             return repo_uri
+
+    def _set_ecr_repository_policy(self, repo_name: str, ecr_client: Any) -> None:
+        """Set ECR repository policy to allow Lambda access.
+
+        Args:
+            repo_name: The ECR repository name.
+            ecr_client: An initialized boto3 ECR client.
+        """
+        policy = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Sid": "LambdaECRImageRetrievalPolicy",
+                    "Effect": "Allow",
+                    "Principal": {
+                        "Service": "lambda.amazonaws.com"
+                    },
+                    "Action": [
+                        "ecr:BatchGetImage",
+                        "ecr:GetDownloadUrlForLayer"
+                    ]
+                }
+            ]
+        }
+
+        try:
+            ecr_client.set_repository_policy(
+                repositoryName=repo_name,
+                policyText=json.dumps(policy)
+            )
+            self._log_info(f"Set ECR repository policy for Lambda access")
+        except ClientError as e:
+            # Policy might already exist
+            if e.response['Error']['Code'] != 'RepositoryPolicyNotFoundException':
+                self._log_error(f"Failed to set repository policy: {e}")
 
     def cleanup_aws_resources(self, iam_client: Any, ecr_client: Any) -> None:
         """Cleans up all managed AWS resources with robust error handling.

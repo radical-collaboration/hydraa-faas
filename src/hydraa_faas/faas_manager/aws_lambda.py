@@ -9,7 +9,8 @@ import json
 import os
 import queue
 import threading
-
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from typing import Any, Dict, List, Optional, Union
@@ -21,7 +22,7 @@ from botocore.exceptions import ClientError
 from hydraa import Task
 
 from ..utils.exceptions import DeploymentException, InvocationException
-from ..utils.packaging import create_deployment_package
+from ..utils.packaging import create_deployment_package, validate_handler
 from ..utils.registry import RegistryManager, RegistryConfig, RegistryType
 from ..utils.resource_manager import ResourceManager
 
@@ -47,7 +48,7 @@ class AWSClientPool:
 
     @lru_cache(maxsize=32)
     def get_client(self, service: str, region: str, access_key: str, secret_key: str):
-        """Get or create a cached client."""
+        """Get or create a cached client with higher connection pool."""
         key = f"{service}:{region}:{access_key[:8]}"
 
         with self._lock:
@@ -55,7 +56,7 @@ class AWSClientPool:
                 config = Config(
                     region_name=region,
                     retries={'max_attempts': 5, 'mode': 'adaptive'},
-                    max_pool_connections=50
+                    max_pool_connections=1000  # Increased for high concurrency
                 )
 
                 self._clients[key] = boto3.client(
@@ -79,7 +80,10 @@ class AwsLambda:
                  auto_terminate: bool,
                  log: Any,
                  resource_config: Dict[str, Any],
-                 profiler: Any):
+                 profiler: Any,
+                 deployment_workers: int = 200,
+                 invocation_workers: int = 50,
+                 enable_metrics: bool = True):
         """Initialize AWS Lambda provider.
 
         Args:
@@ -91,6 +95,9 @@ class AwsLambda:
             log: HYDRA logger instance.
             resource_config: Provider configuration (used for VPC only).
             profiler: HYDRA profiler instance.
+            deployment_workers: Max workers for deployment operations.
+            invocation_workers: Max workers for invocation operations.
+            enable_metrics: Whether to collect performance metrics.
         """
         self.sandbox = sandbox
         self.manager_id = manager_id
@@ -99,6 +106,7 @@ class AwsLambda:
         self.asynchronous = asynchronous
         self.auto_terminate = auto_terminate
         self.resource_config = resource_config
+        self.enable_metrics = enable_metrics
 
         # AWS clients using connection pool
         self.region = cred['region_name']
@@ -132,18 +140,23 @@ class AwsLambda:
             aws_clients={'ecr': self._ecr_client}
         )
 
-        # Function tracking
+        # Function tracking with single lock
         self._functions: Dict[str, Dict[str, Any]] = {}
-        self._functions_lock = threading.RLock()
+        self._provider_lock = threading.RLock()
 
         # Processing queue for async mode
         self.incoming_q = queue.Queue()
         self._terminate = threading.Event()
 
-        # Thread pool for parallel deployments
-        self.executor = ThreadPoolExecutor(
-            max_workers=10,
-            thread_name_prefix="Lambda"
+        # Separate thread pools for deployments and invocations
+        self.deployment_executor = ThreadPoolExecutor(
+            max_workers=deployment_workers,
+            thread_name_prefix="Lambda_Deploy"
+        )
+
+        self.invocation_executor = ThreadPoolExecutor(
+            max_workers=invocation_workers,
+            thread_name_prefix="Lambda_Invoke"
         )
 
         # IAM role (always created/reused, never user-provided)
@@ -164,14 +177,16 @@ class AwsLambda:
     def _setup_resources(self) -> None:
         """Set up AWS resources - only IAM role at startup."""
         self.logger.trace("Setting up AWS Lambda resources")
-        self.profiler.prof('lambda_setup_start', uid=self.manager_id)
+        if self.enable_metrics:
+            self.profiler.prof('lambda_setup_start', uid=self.manager_id)
 
         # Always create/reuse IAM role (no user input)
         self._setup_iam_role()
 
         # ECR is created on-demand during deployment if needed
 
-        self.profiler.prof('lambda_setup_end', uid=self.manager_id)
+        if self.enable_metrics:
+            self.profiler.prof('lambda_setup_end', uid=self.manager_id)
         self.logger.trace("AWS Lambda resources ready")
 
     def _setup_iam_role(self) -> None:
@@ -202,14 +217,13 @@ class AwsLambda:
         if self.resource_manager.aws_resources.ecr_repository_uri:
             repo_uri = self.resource_manager.aws_resources.ecr_repository_uri
             # Extract registry URL from repo URI
-            # repo_uri format: 123456789012.dkr.ecr.us-east-1.amazonaws.com/repo-name
             registry_url = repo_uri.split('/')[0]
 
             # Configure registry manager for existing repo
             ecr_config = RegistryConfig(
                 type=RegistryType.ECR,
                 region=self.region,
-                url=registry_url  # Don't add https:// prefix
+                url=registry_url
             )
             self.registry_manager.configure_registry('aws_ecr', ecr_config)
             return repo_uri
@@ -222,14 +236,13 @@ class AwsLambda:
         )
 
         # Extract registry URL from repo URI
-        # repo_uri format: 123456789012.dkr.ecr.us-east-1.amazonaws.com/repo-name
         registry_url = repo_uri.split('/')[0]
 
         # Configure registry manager with proper URL
         ecr_config = RegistryConfig(
             type=RegistryType.ECR,
             region=self.region,
-            url=registry_url  # Don't add https:// prefix
+            url=registry_url
         )
         self.registry_manager.configure_registry('aws_ecr', ecr_config)
 
@@ -259,7 +272,8 @@ class AwsLambda:
         Returns:
             Function identifier (name).
         """
-        self.profiler.prof('lambda_deploy_start', uid=str(task.id))
+        if self.enable_metrics:
+            self.profiler.prof('lambda_deploy_start', uid=str(task.id))
 
         try:
             # Extract FaaS configuration from Task
@@ -284,100 +298,129 @@ class AwsLambda:
                 faas_config
             )
 
-            # Track deployment
-            with self._functions_lock:
+            # Track deployment with thread safety
+            with self._provider_lock:
                 self._functions[function_name] = {
                     'arn': function_arn,
                     'task_id': str(task.id),
                     'deployment_type': deployment_type
                 }
 
-            self.profiler.prof('lambda_deploy_end', uid=str(task.id))
+            if self.enable_metrics:
+                self.profiler.prof('lambda_deploy_end', uid=str(task.id))
             self.logger.trace(f"Deployed Lambda function: {function_name}")
 
             return function_name
 
         except Exception as e:
-            self.profiler.prof('lambda_deploy_failed', uid=str(task.id))
+            if self.enable_metrics:
+                self.profiler.prof('lambda_deploy_failed', uid=str(task.id))
             raise DeploymentException(f"Lambda deployment failed: {e}")
 
     def deploy_batch_optimized(self, tasks: List[Task]) -> List[str]:
         """Deploy multiple functions in parallel with optimizations."""
-        self.profiler.prof('lambda_batch_start', uid=self.manager_id)
+        if self.enable_metrics:
+            self.profiler.prof('lambda_batch_start', uid=self.manager_id)
 
-        # Group tasks by deployment type for optimization
-        tasks_by_type = {}
+        # Group tasks by deployment type and base image for optimization
+        tasks_by_type_and_image = {}
         for task in tasks:
             faas_config = self._extract_faas_config(task)
             dep_type = self._determine_deployment_type(task, faas_config)
-            tasks_by_type.setdefault(dep_type, []).append((task, faas_config))
+
+            # For container builds, group by base image
+            if dep_type == 'container-build' and hasattr(task, 'image'):
+                base_image = task.image
+            else:
+                base_image = 'none'
+
+            key = (dep_type, base_image)
+            tasks_by_type_and_image.setdefault(key, []).append((task, faas_config))
 
         results = []
         all_futures = {}
 
         # Process each group with type-specific optimizations
-        for dep_type, task_group in tasks_by_type.items():
+        for (dep_type, base_image), task_group in tasks_by_type_and_image.items():
             if dep_type == 'zip':
                 # Parallelize packaging
-                with ThreadPoolExecutor(max_workers=10) as package_executor:
-                    package_futures = {}
-                    for task, faas_config in task_group:
-                        future = package_executor.submit(self._prepare_zip_deployment, task, faas_config)
-                        package_futures[future] = (task, faas_config)
-
-                    # Deploy as packages complete
-                    for future in as_completed(package_futures):
-                        task, faas_config = package_futures[future]
-                        try:
-                            function_name, package_content = future.result()
-                            deploy_future = self.executor.submit(
-                                self._deploy_to_lambda,
-                                task, function_name, package_content, dep_type, faas_config
-                            )
-                            all_futures[deploy_future] = (task, function_name)
-                        except Exception as e:
-                            task.set_exception(e)
+                for task, faas_config in task_group:
+                    future = self.deployment_executor.submit(
+                        self._deploy_single_function,
+                        task, faas_config, dep_type
+                    )
+                    all_futures[future] = task
 
             elif dep_type in ['container-build', 'prebuilt-image']:
-                # Process container deployments
-                for task, faas_config in task_group:
-                    try:
-                        function_name = self._generate_function_name(task)
-                        package = self._create_package(task, dep_type, faas_config)
-
-                        future = self.executor.submit(
-                            self._deploy_to_lambda,
-                            task, function_name, package, dep_type, faas_config
+                # Process container deployments - group by base image for cache efficiency
+                if dep_type == 'container-build' and base_image != 'none':
+                    # Build all containers with same base image in parallel
+                    build_futures = []
+                    for task, faas_config in task_group:
+                        future = self.deployment_executor.submit(
+                            self._prepare_container_deployment,
+                            task, faas_config, dep_type
                         )
-                        all_futures[future] = (task, function_name)
-                    except Exception as e:
-                        task.set_exception(e)
+                        build_futures.append((future, task, faas_config))
+
+                    # Deploy as builds complete
+                    for future, task, faas_config in build_futures:
+                        try:
+                            function_name, package = future.result()
+                            deploy_future = self.deployment_executor.submit(
+                                self._deploy_to_lambda,
+                                task, function_name, package, dep_type, faas_config
+                            )
+                            all_futures[deploy_future] = task
+                        except Exception as e:
+                            task.set_exception(e)
+                else:
+                    # Process individually
+                    for task, faas_config in task_group:
+                        future = self.deployment_executor.submit(
+                            self._deploy_single_function,
+                            task, faas_config, dep_type
+                        )
+                        all_futures[future] = task
 
         # Collect results
         for future in as_completed(all_futures):
-            task, function_name = all_futures[future]
+            task = all_futures[future]
             try:
-                function_arn = future.result()
-                # Track deployment
-                with self._functions_lock:
-                    self._functions[function_name] = {
-                        'arn': function_arn,
-                        'task_id': str(task.id),
-                        'deployment_type': self._determine_deployment_type(task, self._extract_faas_config(task))
-                    }
+                function_name = future.result()
                 results.append(function_name)
                 task.set_result(function_name)
             except Exception as e:
                 self.logger.error(f"Failed to deploy task {task.id}: {e}")
                 task.set_exception(e)
 
-        self.profiler.prof('lambda_batch_end', uid=self.manager_id)
+        if self.enable_metrics:
+            self.profiler.prof('lambda_batch_end', uid=self.manager_id)
         return results
 
-    def _prepare_zip_deployment(self, task: Task, faas_config: Dict[str, Any]) -> tuple:
-        """Prepare a zip deployment package."""
+    def _deploy_single_function(self, task: Task, faas_config: Dict[str, Any], dep_type: str) -> str:
+        """Deploy a single function - helper for parallel deployment."""
         function_name = self._generate_function_name(task)
-        package_content = self._create_package(task, 'zip', faas_config)
+        package = self._create_package(task, dep_type, faas_config)
+
+        function_arn = self._deploy_to_lambda(
+            task, function_name, package, dep_type, faas_config
+        )
+
+        # Track deployment
+        with self._provider_lock:
+            self._functions[function_name] = {
+                'arn': function_arn,
+                'task_id': str(task.id),
+                'deployment_type': dep_type
+            }
+
+        return function_name
+
+    def _prepare_container_deployment(self, task: Task, faas_config: Dict[str, Any], dep_type: str) -> tuple:
+        """Prepare container deployment - separate from actual deployment."""
+        function_name = self._generate_function_name(task)
+        package_content = self._create_package(task, dep_type, faas_config)
         return function_name, package_content
 
     def _extract_faas_config(self, task: Task) -> Dict[str, Any]:
@@ -403,7 +446,8 @@ class AwsLambda:
                     key, value = var.split('=', 1)
                     if key.startswith('FAAS_') and key not in ['FAAS_PROVIDER', 'FAAS_SOURCE',
                                                                'FAAS_HANDLER', 'FAAS_RUNTIME',
-                                                               'FAAS_TIMEOUT', 'FAAS_REGISTRY_URI']:
+                                                               'FAAS_TIMEOUT', 'FAAS_REGISTRY_URI',
+                                                               'FAAS_INLINE_CODE']:
                         # These are granular configs
                         config_key = key.replace('FAAS_', '').lower()
                         try:
@@ -442,7 +486,8 @@ class AwsLambda:
             return 'zip'
 
         # Check for inline code
-        if task.cmd and len(task.cmd) > 2 and task.cmd[0] == 'python' and task.cmd[1] == '-c':
+        inline_code = faas_config.get('inline_code')
+        if inline_code:
             # Inline code + image = container build
             if hasattr(task, 'image') and task.image:
                 return 'container-build'
@@ -454,7 +499,7 @@ class AwsLambda:
             "1. image with full URI (prebuilt-image)\n"
             "2. FAAS_SOURCE=/path/to/code (zip)\n"
             "3. FAAS_SOURCE + image (container-build)\n"
-            "4. inline code via cmd (zip or container-build)"
+            "4. FAAS_INLINE_CODE='your code' (zip or container-build)"
         )
 
     def _is_full_image_uri(self, image: str) -> bool:
@@ -494,11 +539,15 @@ class AwsLambda:
                 self.logger.trace(f"Using auto-created ECR: {repo_uri}")
 
             # Use inline code if no source path
-            if not source_path and task.cmd and len(task.cmd) > 2:
-                source_path = self._create_source_from_inline_code(task, faas_config)
-
             if not source_path:
-                raise DeploymentException("Container build requires source path or inline code")
+                inline_code = faas_config.get('inline_code')
+                if inline_code:
+                    source_path = self._create_source_from_inline_code(task, faas_config)
+                else:
+                    raise DeploymentException("Container build requires source path or inline code")
+
+            if not source_path or not os.path.exists(source_path):
+                raise DeploymentException(f"Source path does not exist: {source_path}")
 
             # Build and push image
             image_uri, _, _ = self.registry_manager.build_and_push_image(
@@ -511,12 +560,25 @@ class AwsLambda:
         else:  # zip deployment
             source_path = faas_config.get('source')
 
-            # Use inline code if no source path
-            if not source_path and task.cmd and len(task.cmd) > 2:
-                source_path = self._create_source_from_inline_code(task, faas_config)
-
+            # Check for inline code
             if not source_path:
-                raise DeploymentException("Zip deployment requires source path or inline code")
+                inline_code = faas_config.get('inline_code')
+                if inline_code:
+                    source_path = self._create_source_from_inline_code(task, faas_config)
+                else:
+                    raise DeploymentException("Zip deployment requires FAAS_SOURCE path or FAAS_INLINE_CODE")
+
+            # Validate source path exists
+            if not os.path.exists(source_path):
+                raise DeploymentException(f"Source path does not exist: {source_path}")
+
+            # Validate handler exists if specified
+            handler = faas_config.get('handler', 'handler.handler')
+            try:
+                validate_handler(source_path, handler)
+            except Exception as e:
+                self.logger.warning(f"Handler validation failed: {e}")
+                # Continue anyway - the handler might be generated during packaging
 
             # Create zip package
             zip_content, _, _ = create_deployment_package(source_path)
@@ -524,10 +586,10 @@ class AwsLambda:
 
     def _create_source_from_inline_code(self, task: Task, faas_config: Dict[str, Any]) -> str:
         """Create temporary source directory from inline code."""
-        if not (task.cmd and len(task.cmd) > 2 and task.cmd[0] == 'python' and task.cmd[1] == '-c'):
-            raise DeploymentException("No inline code found in task.cmd")
+        inline_code = faas_config.get('inline_code')
+        if not inline_code:
+            raise DeploymentException("No inline code found in FAAS_INLINE_CODE")
 
-        code = task.cmd[2]
         source_dir = os.path.join(self.sandbox, f"task_{task.id}_source")
         os.makedirs(source_dir, exist_ok=True)
 
@@ -535,14 +597,14 @@ class AwsLambda:
         handler_file = os.path.join(source_dir, "handler.py")
         with open(handler_file, 'w') as f:
             # Ensure the code has a handler function
-            if 'def handler' not in code:
+            if 'def handler' not in inline_code:
                 # Wrap the code in a handler function
                 f.write("def handler(event, context):\n")
-                indented_code = '\n'.join(f"    {line}" for line in code.split('\n'))
+                indented_code = '\n'.join(f"    {line}" for line in inline_code.split('\n'))
                 f.write(indented_code)
                 f.write("\n    return {'statusCode': 200, 'body': 'Success'}\n")
             else:
-                f.write(code)
+                f.write(inline_code)
 
         # Create Dockerfile if container build
         if self._determine_deployment_type(task, faas_config) == 'container-build':
@@ -600,7 +662,7 @@ CMD ["handler.handler"]
 
         if 'layers' in granular_config:
             params['Layers'] = granular_config['layers'].split(',') if isinstance(granular_config['layers'], str) else \
-            granular_config['layers']
+                granular_config['layers']
 
         if 'dead_letter_queue' in granular_config:
             params['DeadLetterConfig'] = {'TargetArn': granular_config['dead_letter_queue']}
@@ -708,7 +770,7 @@ CMD ["handler.handler"]
         return env_vars
 
     def invoke_function(self, function_name: str, payload: Any = None) -> Dict[str, Any]:
-        """Invoke a Lambda function.
+        """Invoke a Lambda function using the invocation thread pool.
 
         Args:
             function_name: Function name or identifier.
@@ -717,16 +779,26 @@ CMD ["handler.handler"]
         Returns:
             Function response.
         """
-        self.profiler.prof('lambda_invoke_start', uid=function_name)
+        # Submit to invocation thread pool for true parallelism
+        future = self.invocation_executor.submit(
+            self._invoke_function_internal,
+            function_name,
+            payload
+        )
 
+        # Wait for result (caller can use ThreadPoolExecutor for parallel calls)
+        return future.result()
+
+    def _invoke_function_internal(self, function_name: str, payload: Any = None) -> Dict[str, Any]:
+        """Internal function to invoke Lambda - runs in thread pool."""
         try:
-            # Find full function name if needed
-            full_name = None
-            with self._functions_lock:
+            # Fast path: check if we have the full function name
+            with self._provider_lock:
                 if function_name in self._functions:
                     full_name = function_name
                 else:
                     # Search by task ID or partial name
+                    full_name = None
                     for fname, fdata in self._functions.items():
                         if (fdata['task_id'] == function_name or
                                 function_name in fname):
@@ -736,34 +808,30 @@ CMD ["handler.handler"]
             if not full_name:
                 raise InvocationException(f"Function '{function_name}' not found")
 
-            # Invoke
+            # Direct invoke without extra processing
             response = self._lambda_client.invoke(
                 FunctionName=full_name,
-                Payload=json.dumps(payload or {}),
-                LogType='Tail'
+                Payload=json.dumps(payload or {})
             )
 
-            # Parse response
+            # Minimal response processing
             response_payload = json.loads(
                 response['Payload'].read().decode('utf-8')
             )
 
-            self.profiler.prof('lambda_invoke_end', uid=function_name)
-
             return {
                 'statusCode': response['StatusCode'],
-                'payload': response_payload,
-                'logs': response.get('LogResult', '')
+                'payload': response_payload
             }
 
         except Exception as e:
-            self.profiler.prof('lambda_invoke_failed', uid=function_name)
             raise InvocationException(f"Failed to invoke '{function_name}': {e}")
 
     def shutdown(self) -> None:
         """Shutdown provider and cleanup resources."""
         self.logger.trace("Shutting down AWS Lambda provider")
-        self.profiler.prof('lambda_shutdown_start', uid=self.manager_id)
+        if self.enable_metrics:
+            self.profiler.prof('lambda_shutdown_start', uid=self.manager_id)
 
         # Signal termination
         self._terminate.set()
@@ -774,12 +842,12 @@ CMD ["handler.handler"]
 
         # Cleanup functions if auto_terminate
         if self.auto_terminate:
-            with self._functions_lock:
+            with self._provider_lock:
                 function_names = list(self._functions.keys())
 
             cleanup_futures = []
             for name in function_names:
-                future = self.executor.submit(
+                future = self.deployment_executor.submit(
                     self._delete_function,
                     name
                 )
@@ -801,10 +869,12 @@ CMD ["handler.handler"]
         # Save resource state
         self.resource_manager.save_all_resources()
 
-        # Shutdown executor
-        self.executor.shutdown(wait=True)
+        # Shutdown executors
+        self.deployment_executor.shutdown(wait=True)
+        self.invocation_executor.shutdown(wait=True)
 
-        self.profiler.prof('lambda_shutdown_end', uid=self.manager_id)
+        if self.enable_metrics:
+            self.profiler.prof('lambda_shutdown_end', uid=self.manager_id)
         self.logger.trace("AWS Lambda provider shutdown complete")
 
     def _delete_function(self, function_name: str) -> None:

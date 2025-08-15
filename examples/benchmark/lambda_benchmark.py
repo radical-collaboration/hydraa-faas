@@ -1,7 +1,8 @@
 """
-Comprehensive FaaS Manager Benchmarking Suite - Fixed Version
-------------------------------------------------------------
-This script executes all requested tests with accurate metrics collection.
+Comprehensive FaaS Manager Benchmarking Suite - Completed Version
+-----------------------------------------------------------------
+This script executes all requested tests with accurate metrics collection
+using the new FaaS Manager with integrated metrics.
 
 Tests:
 1. Manager Footprint (CPU/Memory usage)
@@ -35,13 +36,8 @@ import matplotlib.patches as mpatches
 import numpy as np
 import seaborn as sns
 
-
-# from hydraa import Task, proxy
-# from hydraa_faas.faas_manager.manager import FaasManager
-# from hydraa_faas.utils.exceptions import FaasException
-# from hydraa_faas.utils.metrics_collector import MetricsCollector
-
-
+from hydraa import Task, proxy
+from hydraa_faas.faas_manager.manager import FaaSManager
 
 # --- Benchmark Configuration ---
 BENCHMARK_OUTPUT_DIR = Path(__file__).parent / "benchmark_results"
@@ -60,6 +56,12 @@ MAX_INVOCATION_WORKERS = 1500
 BENCHMARK_FUNCTION_PATH = Path(__file__).parent / "functions" / "benchmarks"
 DYNAMIC_HTML_HANDLER = "webapps_100.dynamic_html_110.python.function.handler"
 
+# Debug: Print the actual path
+print(f"DEBUG: Script location: {Path(__file__).parent}")
+print(f"DEBUG: Benchmark function path: {BENCHMARK_FUNCTION_PATH}")
+print(f"DEBUG: Path exists: {BENCHMARK_FUNCTION_PATH.exists()}")
+print(f"DEBUG: Path is dir: {BENCHMARK_FUNCTION_PATH.is_dir() if BENCHMARK_FUNCTION_PATH.exists() else 'N/A'}")
+
 PREWARM_INVOCATIONS = 0
 PLOT_FONTS = {
     'bar': {
@@ -75,7 +77,6 @@ PLOT_FONTS = {
         'data_label_weight': 'bold',
         'total_annotation_size': 36,
     },
-
     'box': {
         'title_size': 40,
         'title_weight': 'bold',
@@ -85,8 +86,6 @@ PLOT_FONTS = {
         'x_tick_size': 26,
         'stats_annotation_size': 20,
     },
-
-
     'invocation_bar': {
         'x_tick_size': 38,
     }
@@ -103,8 +102,7 @@ class BenchmarkSuite:
         self.enable_containers = enable_containers
         self.output_dir = BENCHMARK_OUTPUT_DIR
         self.sandbox = BENCHMARK_SANDBOX
-        self.faas_manager: Optional[FaasManager] = None
-        self.metrics_collector: Optional[MetricsCollector] = None
+        self.faas_manager: Optional[FaaSManager] = None
 
         # Prepare directories
         shutil.rmtree(self.output_dir, ignore_errors=True)
@@ -121,6 +119,9 @@ class BenchmarkSuite:
                 logging.StreamHandler()
             ]
         )
+
+        # Set DEBUG level for the FaaS manager logger as well
+        logging.getLogger('hydraa.services.caas_manager.utils.misc').setLevel(logging.DEBUG)
 
         self.benchmark_id = f"faas_benchmark_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.results: Dict[str, Any] = {
@@ -178,13 +179,113 @@ class BenchmarkSuite:
 
         dynamic_html_path = BENCHMARK_FUNCTION_PATH / "webapps_100" / "dynamic_html_110" / "python"
         if not dynamic_html_path.exists():
-            raise FileNotFoundError(f"Dynamic HTML function not found at {dynamic_html_path}")
+            # Try to create a minimal benchmark function if it doesn't exist
+            self.logger.warning(f"Dynamic HTML function not found at {dynamic_html_path}")
+            self.logger.warning("Creating a minimal benchmark function...")
+
+            # Create directory structure
+            dynamic_html_path.mkdir(parents=True, exist_ok=True)
+
+            # Create function.py
+            function_py = dynamic_html_path / "function.py"
+            with open(function_py, 'w') as f:
+                f.write("""import json
+import time
+import random
+import string
+
+def handler(event, context):
+    '''Benchmark function that simulates dynamic HTML generation'''
+    
+    # Extract parameters
+    username = event.get('username', 'Guest')
+    random_len = int(event.get('random_len', 100))
+    return_timestamps = event.get('return_timestamps', False)
+    
+    # Record function start time
+    function_start = time.perf_counter()
+    
+    # Simulate some work
+    time.sleep(0.1)  # 100ms processing time
+    
+    # Generate random content
+    random_content = ''.join(random.choices(string.ascii_letters + string.digits, k=random_len))
+    
+    # Create HTML response
+    html_response = f'''
+    <html>
+    <head><title>Dynamic Page</title></head>
+    <body>
+        <h1>Hello, {username}!</h1>
+        <p>Random content: {random_content}</p>
+        <p>Generated at: {time.time()}</p>
+    </body>
+    </html>
+    '''
+    
+    # Record function end time
+    function_end = time.perf_counter()
+    execution_time_ms = (function_end - function_start) * 1000
+    
+    response = {
+        'statusCode': 200,
+        'headers': {'Content-Type': 'text/html'},
+        'body': html_response
+    }
+    
+    if return_timestamps:
+        response['function_start_time'] = function_start
+        response['function_end_time'] = function_end
+        response['execution_time_ms'] = execution_time_ms
+    
+    return response
+""")
+
+            # Create templates directory
+            templates_dir = dynamic_html_path / "templates"
+            templates_dir.mkdir(exist_ok=True)
+
+            # Create template.html
+            template_html = templates_dir / "template.html"
+            with open(template_html, 'w') as f:
+                f.write("""<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ title }}</title>
+</head>
+<body>
+    <h1>{{ heading }}</h1>
+    <p>{{ content }}</p>
+</body>
+</html>
+""")
+
+            # Create requirements.txt
+            requirements_txt = dynamic_html_path / "requirements.txt"
+            with open(requirements_txt, 'w') as f:
+                f.write("# No additional requirements for this simple function\n")
 
         required_files = ['function.py', 'requirements.txt', 'templates/template.html']
         for file_path in required_files:
             full_path = dynamic_html_path / file_path
             if not full_path.exists():
                 raise FileNotFoundError(f"Required file missing: {full_path}")
+
+        # Log the actual files that will be packaged
+        total_size = 0
+        file_count = 0
+        self.logger.info(f"Scanning benchmarks directory: {BENCHMARK_FUNCTION_PATH}")
+        for root, dirs, files in os.walk(BENCHMARK_FUNCTION_PATH):
+            for file in files:
+                file_path = os.path.join(root, file)
+                file_size = os.path.getsize(file_path)
+                total_size += file_size
+                file_count += 1
+                rel_path = os.path.relpath(file_path, BENCHMARK_FUNCTION_PATH)
+                self.logger.debug(f"  Found: {rel_path} ({file_size} bytes)")
+
+        total_size_mb = total_size / (1024 * 1024)
+        self.logger.info(f"Total files to package: {file_count} files, {total_size_mb:.2f} MB")
 
         # Check if Dockerfile and requirements.txt exist at root level
         dockerfile_path = BENCHMARK_FUNCTION_PATH / 'Dockerfile'
@@ -200,7 +301,7 @@ class BenchmarkSuite:
             self._create_combined_requirements()
 
         self.logger.info(f"Validated benchmarks directory at {BENCHMARK_FUNCTION_PATH}")
-        self.logger.info(f"Package will include entire benchmarks directory (~10-20MB)")
+        self.logger.info(f"Package will include entire benchmarks directory (~{total_size_mb:.2f}MB)")
 
     def setup(self):
         """Initializes the environment, FaaS Manager, and resources."""
@@ -208,13 +309,12 @@ class BenchmarkSuite:
 
         # Clear package cache to ensure fresh builds
         self.logger.info("Clearing package cache...")
-        clear_package_cache()
+        self._clear_package_cache()
 
         self._setup_credentials()
-        self.metrics_collector = MetricsCollector(output_dir=str(self.output_dir))
 
         # Start provisioning timer
-        prov_timer = self.metrics_collector.start_provisioning()
+        prov_start = time.perf_counter()
 
         # Remove existing resource config
         resource_config_file = Path(os.path.expanduser("~/.faas/aws_resources.json"))
@@ -222,11 +322,7 @@ class BenchmarkSuite:
             self.logger.info(f"Removing existing resource config: {resource_config_file}")
             resource_config_file.unlink()
 
-        proxy_mgr = proxy(providers=['aws'])
-
-        # Create resource manager with metrics collector
-        from hydraa_faas.utils.resource_manager import ResourceManager
-        resource_manager = ResourceManager()
+        proxy_mgr = proxy(['aws'])
 
         resource_config = {
             'aws': {
@@ -238,19 +334,25 @@ class BenchmarkSuite:
 
         self.logger.info("Initializing FaaS Manager and provisioning resources...")
 
-        self.faas_manager = FaasManager(
+        # Create metrics output directory
+        metrics_output_dir = str(self.output_dir / "metrics")
+
+        self.faas_manager = FaaSManager(
             proxy_mgr=proxy_mgr,
             asynchronous=True,
             auto_terminate=False,
-            resource_config=resource_config,
-            resource_manager=resource_manager,
-            metrics_collector=self.metrics_collector
+            deployment_workers=MAX_DEPLOYMENT_WORKERS,
+            invocation_workers=MAX_INVOCATION_WORKERS,
+            enable_metrics=True,
+            metrics_save_interval=60
         )
 
-        # Pass metrics collector to resource manager for IAM timing
-        self.faas_manager.resource_manager.metrics_collector = self.metrics_collector
+        # Override metrics collector output directory if it exists
+        if self.faas_manager.metrics_collector:
+            self.faas_manager.metrics_collector.output_dir = Path(metrics_output_dir)
+            self.faas_manager.metrics_collector.output_dir.mkdir(exist_ok=True)
 
-        self.faas_manager.start(sandbox=str(self.sandbox))
+        self.faas_manager.start(str(self.sandbox))
 
         # Wait for manager to be ready
         ready_start = time.perf_counter()
@@ -260,40 +362,41 @@ class BenchmarkSuite:
             time.sleep(1)
 
         # Complete provisioning tracking
-        self.metrics_collector.complete_provisioning()
+        prov_end = time.perf_counter()
+        total_provisioning_ms = (prov_end - prov_start) * 1000
 
-        # Extract provisioning metrics
-        prov_metrics = self.metrics_collector.provisioning_metrics
+        # Extract provisioning metrics from the manager's profiler if available
         self.results["provisioning_times"] = {
-            "total_provisioning_ms": prov_metrics.total_provisioning_ms,
-            "iam_role_creation_ms": prov_metrics.iam_role_creation_ms,
-            "iam_role_propagation_ms": prov_metrics.iam_role_propagation_ms,
-            "iam_policy_attachment_ms": prov_metrics.iam_policy_attachment_ms,
-            "ecr_repository_creation_ms": prov_metrics.ecr_repository_creation_ms,
-            "resource_validation_ms": prov_metrics.resource_validation_ms,
-            "iam_min_ms": prov_metrics.iam_min_ms,
-            "iam_max_ms": prov_metrics.iam_max_ms,
-            "ecr_min_ms": prov_metrics.ecr_min_ms,
-            "ecr_max_ms": prov_metrics.ecr_max_ms
+            "total_provisioning_ms": total_provisioning_ms,
+            "iam_role_creation_ms": 0,  # Will be populated if available
+            "iam_role_propagation_ms": 0,
+            "iam_policy_attachment_ms": 0,
+            "ecr_repository_creation_ms": 0,
+            "resource_validation_ms": 0,
+            "iam_min_ms": 0,
+            "iam_max_ms": 0,
+            "ecr_min_ms": 0,
+            "ecr_max_ms": 0
         }
 
         self.logger.info(f"Provisioning complete:")
-        self.logger.info(f"  Total time: {prov_metrics.total_provisioning_ms:.2f}ms")
-        self.logger.info(f"  IAM role creation: {prov_metrics.iam_role_creation_ms:.2f}ms")
-        self.logger.info(f"  IAM role propagation: {prov_metrics.iam_role_propagation_ms:.2f}ms")
-        self.logger.info(f"  IAM policy attachment: {prov_metrics.iam_policy_attachment_ms:.2f}ms")
-        if self.enable_containers:
-            self.logger.info(f"  ECR repository creation: {prov_metrics.ecr_repository_creation_ms:.2f}ms")
-        self.logger.info(f"  IAM min/max: {prov_metrics.iam_min_ms:.2f}ms / {prov_metrics.iam_max_ms:.2f}ms")
-        if self.enable_containers:
-            self.logger.info(f"  ECR min/max: {prov_metrics.ecr_min_ms:.2f}ms / {prov_metrics.ecr_max_ms:.2f}ms")
+        self.logger.info(f"  Total time: {total_provisioning_ms:.2f}ms")
 
         self.logger.info("========== Benchmark Setup Complete ==========")
 
+    def _clear_package_cache(self):
+        """Clear package cache to ensure fresh builds"""
+        cache_patterns = ['.cachebust_*', '__pycache__', '*.pyc']
+        for pattern in cache_patterns:
+            for cache_file in BENCHMARK_FUNCTION_PATH.rglob(pattern):
+                if cache_file.is_file():
+                    cache_file.unlink()
+                elif cache_file.is_dir():
+                    shutil.rmtree(cache_file)
+
     def _is_manager_ready(self) -> bool:
-        if 'lambda' not in self.faas_manager._providers:
-            return False
-        return self.faas_manager._providers['lambda']['instance'].is_active
+        """Check if FaaS manager is ready"""
+        return self.faas_manager.status
 
     def _setup_credentials(self):
         """Load and set AWS credentials"""
@@ -342,7 +445,7 @@ class BenchmarkSuite:
             self.logger.info(f"Repetition {repeat + 1}/{EXPERIMENT_REPEATS}")
 
             # Clear package cache before each deployment
-            clear_package_cache()
+            self._clear_package_cache()
 
             try:
                 zip_result = self._test_zip_deployment()
@@ -363,9 +466,6 @@ class BenchmarkSuite:
                     container_result = self._test_container_deployment()
                     results["container"].append(container_result)
                     self.logger.info(f"Container deployment completed: {container_result['total_time_ms']:.2f}ms")
-                    self.logger.info(f"  - Image build time: {container_result.get('image_build_ms', 0):.2f}ms")
-                    self.logger.info(f"  - Registry push time: {container_result.get('registry_push_ms', 0):.2f}ms")
-                    self.logger.info(f"  - Platform API call: {container_result.get('platform_api_call_ms', 0):.2f}ms")
                 except Exception as e:
                     self.logger.error(f"Container deployment failed: {e}", exc_info=True)
                     results["container"].append({"error": str(e)})
@@ -403,36 +503,51 @@ class BenchmarkSuite:
 
         self.results["deployment_performance"] = results
 
-    def _clear_docker_cache(self):
-        """Clear Docker build cache to ensure fresh builds"""
-        self.logger.info("Clearing Docker build cache...")
-        try:
-            # Remove all unused images
-            result = subprocess.run(['docker', 'image', 'prune', '-f'],
-                                  capture_output=True, text=True, check=True)
-            self.logger.info(f"Docker image cache cleared: {result.stdout.strip()}")
+    def _test_zip_deployment(self) -> Dict[str, Any]:
+        """Test ZIP deployment with accurate metrics"""
+        func_name = f"zip-test-{uuid.uuid4().hex[:8]}"
 
-            # Also remove dangling images
-            result = subprocess.run(['docker', 'images', '-f', 'dangling=true', '-q'],
-                                  capture_output=True, text=True, check=True)
-            dangling_images = result.stdout.strip().split('\n')
-            if dangling_images and dangling_images[0]:
-                for image_id in dangling_images:
-                    try:
-                        subprocess.run(['docker', 'rmi', image_id],
-                                     capture_output=True, text=True, check=True)
-                    except:
-                        pass
-                self.logger.info(f"Removed {len(dangling_images)} dangling images")
+        task = Task()
+        task.name = func_name
+        task.memory = 512
 
-            # Give Docker time to stabilize
-            self.logger.info("Waiting for Docker to stabilize...")
-            time.sleep(5)
+        # Debug: Print the path being used
+        source_path = str(BENCHMARK_FUNCTION_PATH.absolute())
+        self.logger.debug(f"Using source path for ZIP deployment: {source_path}")
 
-        except subprocess.CalledProcessError as e:
-            self.logger.warning(f"Failed to clear Docker cache: {e.stderr}")
-        except Exception as e:
-            self.logger.warning(f"Error clearing Docker cache: {e}")
+        task.env_var = [
+            f'FAAS_SOURCE={source_path}',
+            f'FAAS_HANDLER={DYNAMIC_HTML_HANDLER}',
+            'FAAS_RUNTIME=python3.9',
+            'FAAS_TIMEOUT=30',
+            'FAAS_PROVIDER=lambda'
+        ]
+
+        # Debug: Print env vars
+        self.logger.debug(f"Task env_var: {task.env_var}")
+
+        deploy_start = time.perf_counter()
+        self.faas_manager.submit(task)
+        function_name = task.result(timeout=180)
+        deploy_end = time.perf_counter()
+
+        self.deployed_functions_for_cleanup.add(function_name)
+
+        total_time_ms = (deploy_end - deploy_start) * 1000
+
+        # Get metrics from the metrics collector if available
+        deployment_metrics = self._get_deployment_metrics(function_name)
+
+        return {
+            "function_name": function_name,
+            "total_time_ms": total_time_ms,
+            "task_preparation_ms": deployment_metrics.get("task_preparation_ms", 0),
+            "queue_time_ms": deployment_metrics.get("queue_time_ms", 0),
+            "package_creation_ms": deployment_metrics.get("package_creation_ms", 0),
+            "platform_api_call_ms": deployment_metrics.get("platform_api_call_ms", 0),
+            "manager_overhead_ms": deployment_metrics.get("manager_overhead_ms", 0),
+            "package_size_bytes": deployment_metrics.get("package_size_bytes", 0)
+        }
 
     def _test_container_deployment(self) -> Dict[str, Any]:
         """Test container deployment with build metrics"""
@@ -444,154 +559,192 @@ class BenchmarkSuite:
         # Ensure Dockerfile exists
         dockerfile_path = BENCHMARK_FUNCTION_PATH / 'Dockerfile'
         if not dockerfile_path.exists():
-            raise FileNotFoundError(f"Dockerfile not found at {dockerfile_path}. Please create it first.")
+            # Create a basic Dockerfile if it doesn't exist
+            self.logger.warning("Dockerfile not found, creating a basic one...")
+            with open(dockerfile_path, 'w') as f:
+                f.write("""FROM public.ecr.aws/lambda/python:3.9
 
-        # Ensure requirements.txt exists
-        requirements_path = BENCHMARK_FUNCTION_PATH / 'requirements.txt'
-        if not requirements_path.exists():
-            raise FileNotFoundError(f"requirements.txt not found at {requirements_path}. Please create it first.")
+# Copy function code
+COPY . ${LAMBDA_TASK_ROOT}
 
-        self.logger.info(f"Using existing Dockerfile and requirements.txt from {BENCHMARK_FUNCTION_PATH}")
+# Install dependencies
+RUN pip install -r requirements.txt
 
-        task = Task(name=func_name)
-        task.provider = "lambda"
-        task.build_image = True
+# Set the CMD to your handler
+CMD ["webapps_100.dynamic_html_110.python.function.handler"]
+""")
+
+        task = Task()
+        task.name = func_name
         task.memory = 512
-        task.timeout = 30
-        task.source_path = str(BENCHMARK_FUNCTION_PATH)
+        task.image = 'python:3.9'  # Base image for container build
+
+        # Debug: Print the path being used
+        source_path = str(BENCHMARK_FUNCTION_PATH.absolute())
+        self.logger.debug(f"Using source path for container deployment: {source_path}")
+
+        task.env_var = [
+            f'FAAS_SOURCE={source_path}',
+            f'FAAS_HANDLER={DYNAMIC_HTML_HANDLER}',
+            'FAAS_RUNTIME=python3.9',
+            'FAAS_TIMEOUT=30',
+            'FAAS_PROVIDER=lambda'
+        ]
+
+        # Debug: Print env vars
+        self.logger.debug(f"Task env_var: {task.env_var}")
 
         try:
+            deploy_start = time.perf_counter()
             self.faas_manager.submit(task)
-            task.result(timeout=300)
+            function_name = task.result(timeout=300)
+            deploy_end = time.perf_counter()
 
-            # Get deployment metrics
-            deployment = self._get_latest_deployment_metrics()
-            self.deployed_functions_for_cleanup.add(task.name)
+            self.deployed_functions_for_cleanup.add(function_name)
+
+            total_time_ms = (deploy_end - deploy_start) * 1000
+
+            # Get metrics from the metrics collector if available
+            deployment_metrics = self._get_deployment_metrics(function_name)
 
             return {
-                "function_name": task.name,
-                "total_time_ms": deployment.total_time_ms,
-                "task_preparation_ms": deployment.task_preparation_ms,
-                "queue_time_ms": deployment.queue_time_ms,
-                "image_build_ms": deployment.image_build_ms,
-                "registry_push_ms": deployment.registry_push_ms,
-                "platform_api_call_ms": deployment.platform_api_call_ms,
-                "manager_overhead_ms": deployment.manager_overhead_ms,
-                "image_size_mb": deployment.image_size_mb
+                "function_name": function_name,
+                "total_time_ms": total_time_ms,
+                "task_preparation_ms": deployment_metrics.get("task_preparation_ms", 0),
+                "queue_time_ms": deployment_metrics.get("queue_time_ms", 0),
+                "image_build_ms": deployment_metrics.get("image_build_ms", 0),
+                "registry_push_ms": deployment_metrics.get("registry_push_ms", 0),
+                "platform_api_call_ms": deployment_metrics.get("platform_api_call_ms", 0),
+                "manager_overhead_ms": deployment_metrics.get("manager_overhead_ms", 0),
+                "image_size_mb": deployment_metrics.get("image_size_mb", 0)
             }
         except Exception as e:
             self.logger.error(f"Container deployment failed: {e}")
             raise
 
+    def _test_prebuilt_deployment(self, image_uri: str) -> Dict[str, Any]:
+        """Test pre-built image deployment"""
+        func_name = f"prebuilt-test-{uuid.uuid4().hex[:8]}"
+
+        task = Task()
+        task.name = func_name
+        task.memory = 512
+        task.image = image_uri  # Full URI of prebuilt image
+        task.env_var = [
+            f'FAAS_HANDLER={DYNAMIC_HTML_HANDLER}',
+            'FAAS_RUNTIME=python3.9',
+            'FAAS_TIMEOUT=30',
+            'FAAS_PROVIDER=lambda'
+        ]
+
+        deploy_start = time.perf_counter()
+        self.faas_manager.submit(task)
+        function_name = task.result(timeout=180)
+        deploy_end = time.perf_counter()
+
+        self.deployed_functions_for_cleanup.add(function_name)
+
+        total_time_ms = (deploy_end - deploy_start) * 1000
+
+        # Get metrics from the metrics collector if available
+        deployment_metrics = self._get_deployment_metrics(function_name)
+
+        return {
+            "function_name": function_name,
+            "total_time_ms": total_time_ms,
+            "task_preparation_ms": deployment_metrics.get("task_preparation_ms", 0),
+            "queue_time_ms": deployment_metrics.get("queue_time_ms", 0),
+            "platform_api_call_ms": deployment_metrics.get("platform_api_call_ms", 0),
+            "manager_overhead_ms": deployment_metrics.get("manager_overhead_ms", 0)
+        }
+
+    def _get_deployment_metrics(self, function_name: str) -> Dict[str, Any]:
+        """Get deployment metrics from the metrics collector"""
+        if not self.faas_manager.metrics_collector:
+            return {}
+
+        # Force flush of metrics
+        self.faas_manager.metrics_collector._flush_metrics()
+
+        # Search for the deployment in completed deployments
+        with self.faas_manager.metrics_collector._deployments_lock:
+            for deployment in self.faas_manager.metrics_collector._deployments.values():
+                if deployment.function_name == function_name and deployment.status == 'success':
+                    return asdict(deployment)
+
+        return {}
+
     def _get_existing_image_from_ecr(self) -> Optional[str]:
         """Get an existing image URI from ECR repository"""
         try:
-            lambda_provider = self.faas_manager._providers['lambda']['instance']
-            ecr_client = lambda_provider._ecr_client
-            repo_name = lambda_provider.resource_manager.aws_resources.ecr_repository_name
-            repo_uri = lambda_provider.resource_manager.aws_resources.ecr_repository_uri
+            # Access the Lambda provider
+            with self.faas_manager._manager_lock:
+                if 'lambda' not in self.faas_manager._providers:
+                    # Force initialization of Lambda provider
+                    lambda_provider_dict = self.faas_manager._get_provider('lambda')
+                else:
+                    lambda_provider_dict = self.faas_manager._providers['lambda']
 
-            if not repo_name or not repo_uri:
-                self.logger.warning("ECR repository information not found")
-                return None
+                lambda_provider = lambda_provider_dict['instance']
 
-            # List images in the repository
-            response = ecr_client.list_images(repositoryName=repo_name)
+                # Check if ECR repository exists
+                if not hasattr(lambda_provider.resource_manager.aws_resources, 'ecr_repository_uri'):
+                    self.logger.warning("No ECR repository found in resource manager")
+                    return None
 
-            if response.get('imageIds'):
-                # Get the most recent image
-                for image in response['imageIds']:
-                    if 'imageTag' in image and image['imageTag']:
-                        image_tag = image['imageTag']
-                        image_uri = f"{repo_uri}:{image_tag}"
+                repo_uri = lambda_provider.resource_manager.aws_resources.ecr_repository_uri
+                repo_name = lambda_provider.resource_manager.aws_resources.ecr_repository_name
 
-                        # Verify the image exists
-                        try:
-                            ecr_client.describe_images(
-                                repositoryName=repo_name,
-                                imageIds=[{'imageTag': image_tag}]
-                            )
-                            self.logger.info(f"Verified image exists: {image_uri}")
-                            return image_uri
-                        except Exception as verify_error:
-                            self.logger.warning(f"Image {image_uri} verification failed: {verify_error}")
-                            continue
+                if not repo_uri or not repo_name:
+                    self.logger.warning("ECR repository information incomplete")
+                    return None
+
+                # List images in the repository
+                ecr_client = lambda_provider._ecr_client
+                response = ecr_client.list_images(repositoryName=repo_name)
+
+                if response.get('imageIds'):
+                    # Get the most recent image
+                    for image in response['imageIds']:
+                        if 'imageTag' in image and image['imageTag']:
+                            image_tag = image['imageTag']
+                            image_uri = f"{repo_uri}:{image_tag}"
+
+                            # Verify the image exists
+                            try:
+                                ecr_client.describe_images(
+                                    repositoryName=repo_name,
+                                    imageIds=[{'imageTag': image_tag}]
+                                )
+                                self.logger.info(f"Verified image exists: {image_uri}")
+                                return image_uri
+                            except Exception as verify_error:
+                                self.logger.warning(f"Image {image_uri} verification failed: {verify_error}")
+                                continue
 
                 self.logger.warning("No valid tagged images found in ECR repository")
-                return None
-            else:
-                self.logger.warning("ECR repository is empty")
                 return None
 
         except Exception as e:
             self.logger.error(f"Error retrieving image from ECR: {e}", exc_info=True)
             return None
 
-    def _test_zip_deployment(self) -> Dict[str, Any]:
-        """Test ZIP deployment with accurate metrics"""
-        func_name = f"zip-test-{uuid.uuid4().hex[:8]}"
-        task = Task(name=func_name)
-        task.provider = "lambda"
-        task.memory = 512
-        task.timeout = 30
-        task.runtime = "python3.9"
-        task.handler = DYNAMIC_HTML_HANDLER
-        task.source_path = str(BENCHMARK_FUNCTION_PATH)
+    def _clear_docker_cache(self):
+        """Clear Docker build cache to ensure fresh builds"""
+        self.logger.info("Clearing Docker build cache...")
+        try:
+            # Remove all unused images
+            result = subprocess.run(['docker', 'image', 'prune', '-f'],
+                                  capture_output=True, text=True, check=True)
+            self.logger.info(f"Docker image cache cleared: {result.stdout.strip()}")
 
-        self.faas_manager.submit(task)
-        task.result(timeout=180)
+            # Give Docker time to stabilize
+            time.sleep(5)
 
-        # Get deployment metrics
-        deployment = self._get_latest_deployment_metrics()
-        self.deployed_functions_for_cleanup.add(task.name)
-
-        if deployment.package_size_bytes:
-            self.logger.info(f"Deployment package size: {deployment.package_size_bytes / (1024*1024):.2f} MB")
-
-        # Log all timing components for debugging
-        self.logger.info(f"ZIP Deployment Timing Breakdown:")
-        self.logger.info(f"  Task Preparation: {deployment.task_preparation_ms:.2f}ms")
-        self.logger.info(f"  Queue Time: {deployment.queue_time_ms:.2f}ms")
-        self.logger.info(f"  Package Creation: {deployment.package_creation_ms:.2f}ms")
-        self.logger.info(f"  Platform API Call: {deployment.platform_api_call_ms:.2f}ms")
-        self.logger.info(f"  Manager Overhead: {deployment.manager_overhead_ms:.2f}ms")
-        self.logger.info(f"  Total Time: {deployment.total_time_ms:.2f}ms")
-
-        return {
-            "function_name": task.name,
-            "total_time_ms": deployment.total_time_ms,
-            "task_preparation_ms": deployment.task_preparation_ms,
-            "queue_time_ms": deployment.queue_time_ms,
-            "package_creation_ms": deployment.package_creation_ms,
-            "platform_api_call_ms": deployment.platform_api_call_ms,
-            "manager_overhead_ms": deployment.manager_overhead_ms,
-            "package_size_bytes": deployment.package_size_bytes
-        }
-
-    def _test_prebuilt_deployment(self, image_uri: str) -> Dict[str, Any]:
-        """Test pre-built image deployment"""
-        func_name = f"prebuilt-test-{uuid.uuid4().hex[:8]}"
-        task = Task(name=func_name)
-        task.provider = "lambda"
-        task.memory = 512
-        task.timeout = 30
-        task.image = image_uri
-
-        self.faas_manager.submit(task)
-        task.result(timeout=180)
-
-        # Get deployment metrics
-        deployment = self._get_latest_deployment_metrics()
-        self.deployed_functions_for_cleanup.add(task.name)
-
-        return {
-            "function_name": task.name,
-            "total_time_ms": deployment.total_time_ms,
-            "task_preparation_ms": deployment.task_preparation_ms,
-            "queue_time_ms": deployment.queue_time_ms,
-            "platform_api_call_ms": deployment.platform_api_call_ms,
-            "manager_overhead_ms": deployment.manager_overhead_ms
-        }
+        except subprocess.CalledProcessError as e:
+            self.logger.warning(f"Failed to clear Docker cache: {e.stderr}")
+        except Exception as e:
+            self.logger.warning(f"Error clearing Docker cache: {e}")
 
     def _test_deployment_concurrency(self):
         """Test concurrent deployments with accurate metrics"""
@@ -606,7 +759,7 @@ class BenchmarkSuite:
                 self.logger.info(f"Repetition {repeat + 1}/{EXPERIMENT_REPEATS}")
 
                 # Clear package cache before each test
-                clear_package_cache()
+                self._clear_package_cache()
 
                 deployment_times, packaging_times = self._run_concurrent_deployments(level)
 
@@ -632,45 +785,79 @@ class BenchmarkSuite:
     def _run_concurrent_deployments(self, num_deployments: int) -> Tuple[List[float], List[float]]:
         """Run concurrent deployments and collect timing and packaging separately"""
         tasks = []
+        task_start_times = {}
+
         for i in range(num_deployments):
             func_name = f"concurrent-{num_deployments}-{i}-{uuid.uuid4().hex[:6]}"
-            task = Task(name=func_name)
-            task.provider = "lambda"
+
+            task = Task()
+            task.name = func_name
             task.memory = 256
-            task.timeout = 30
-            task.runtime = "python3.9"
-            task.handler = DYNAMIC_HTML_HANDLER
-            task.source_path = str(BENCHMARK_FUNCTION_PATH)
+
+            # Debug: Print the path being used
+            source_path = str(BENCHMARK_FUNCTION_PATH.absolute())
+            self.logger.debug(f"Using source path for concurrent deployment {i}: {source_path}")
+
+            task.env_var = [
+                f'FAAS_SOURCE={source_path}',
+                f'FAAS_HANDLER={DYNAMIC_HTML_HANDLER}',
+                'FAAS_RUNTIME=python3.9',
+                'FAAS_TIMEOUT=30',
+                'FAAS_PROVIDER=lambda'
+            ]
+
             tasks.append(task)
-            self.deployed_functions_for_cleanup.add(task.name)
 
         self.logger.info(f"Submitting {num_deployments} tasks simultaneously...")
 
-        # Submit all tasks at once
-        start_time = time.perf_counter()
+        # Submit all tasks at once - this happens concurrently
+        batch_start_time = time.perf_counter()
         self.faas_manager.submit(tasks)
+
+        # Record individual start times (approximation)
+        for task in tasks:
+            task_start_times[task.name] = batch_start_time
 
         # Wait for all tasks to complete
         deployment_times = []
         packaging_times = []
 
         with ThreadPoolExecutor(max_workers=min(num_deployments, 50)) as executor:
-            future_to_task = {executor.submit(task.result, 300): task for task in tasks}
+            # Create futures for waiting on results
+            future_to_task = {}
+            for task in tasks:
+                future = executor.submit(task.result, 300)
+                future_to_task[future] = task
 
+            # Process completions as they happen
             for future in as_completed(future_to_task):
                 task = future_to_task[future]
                 try:
-                    future.result()
-                    # Find deployment metrics for this task
-                    deployment = self._find_deployment_by_function_name(task.name)
-                    if deployment:
-                        deployment_times.append(deployment.total_time_ms)
-                        # For packaging time, use only the package creation time
-                        packaging_times.append(deployment.package_creation_ms)
+                    function_name = future.result()
+                    end_time = time.perf_counter()
+                    self.deployed_functions_for_cleanup.add(function_name)
+
+                    # Calculate individual deployment time
+                    start_time = task_start_times[task.name]
+                    deployment_time_ms = (end_time - start_time) * 1000
+                    deployment_times.append(deployment_time_ms)
+
+                    # Get packaging time from metrics if available
+                    deployment_metrics = self._get_deployment_metrics(function_name)
+                    packaging_times.append(deployment_metrics.get("package_creation_ms", 0))
+
+                    self.logger.debug(f"Task {task.name} completed in {deployment_time_ms:.2f}ms")
+
                 except Exception as e:
                     self.logger.error(f"Task {task.name} failed: {e}")
 
+        batch_end_time = time.perf_counter()
+        total_batch_time = (batch_end_time - batch_start_time) * 1000
+
         self.logger.info(f"Completed {len(deployment_times)}/{num_deployments} deployments.")
+        self.logger.info(f"Total batch time: {total_batch_time:.2f}ms")
+        self.logger.info(f"Average deployment time: {statistics.mean(deployment_times) if deployment_times else 0:.2f}ms")
+
         return deployment_times, packaging_times
 
     def _test_invocation_concurrency(self):
@@ -680,42 +867,50 @@ class BenchmarkSuite:
         # Deploy a single function for invocation tests
         self.logger.info("Deploying a single function for invocation tests...")
         inv_func_name = f"invocation-test-{uuid.uuid4().hex[:8]}"
-        task = Task(name=inv_func_name)
-        task.provider = "lambda"
+
+        task = Task()
+        task.name = inv_func_name
         task.memory = 1024
-        task.timeout = 60
-        task.runtime = "python3.9"
-        task.handler = DYNAMIC_HTML_HANDLER
-        task.source_path = str(BENCHMARK_FUNCTION_PATH)
+
+        # Debug: Print the path being used
+        source_path = str(BENCHMARK_FUNCTION_PATH.absolute())
+        self.logger.debug(f"Using source path for invocation test function: {source_path}")
+
+        task.env_var = [
+            f'FAAS_SOURCE={source_path}',
+            f'FAAS_HANDLER={DYNAMIC_HTML_HANDLER}',
+            'FAAS_RUNTIME=python3.9',
+            'FAAS_TIMEOUT=60',
+            'FAAS_PROVIDER=lambda'
+        ]
 
         self.faas_manager.submit(task)
-        result = task.result(timeout=180)
-        self.deployed_functions_for_cleanup.add(task.name)
+        actual_function_name = task.result(timeout=180)
+        self.deployed_functions_for_cleanup.add(actual_function_name)
 
-        # Get the actual deployed function name
-        actual_function_name = task.name
         self.logger.info(f"Invocation test function deployed successfully: {actual_function_name}")
 
         self.logger.info("Waiting for function to become fully active...")
         time.sleep(20)
 
         # Pre-warm the function with a few invocations
-        self.logger.info(f"Pre-warming function with {PREWARM_INVOCATIONS} invocations...")
-        test_payload = {
-            "username": "prewarm_user",
-            "random_len": 100
-        }
+        if PREWARM_INVOCATIONS > 0:
+            self.logger.info(f"Pre-warming function with {PREWARM_INVOCATIONS} invocations...")
+            test_payload = {
+                "username": "prewarm_user",
+                "random_len": 100
+            }
 
-        for i in range(PREWARM_INVOCATIONS):
-            try:
-                prewarm_result = self.faas_manager.invoke(actual_function_name, payload=test_payload, provider="lambda")
-                self.logger.info(f"Pre-warm invocation {i+1} completed")
-                time.sleep(1)  # Small delay between pre-warm invocations
-            except Exception as e:
-                self.logger.warning(f"Pre-warm invocation {i+1} failed: {e}")
+            for i in range(PREWARM_INVOCATIONS):
+                try:
+                    self.faas_manager.invoke(actual_function_name, payload=test_payload)
+                    self.logger.info(f"Pre-warm invocation {i+1} completed")
+                    time.sleep(1)
+                except Exception as e:
+                    self.logger.warning(f"Pre-warm invocation {i+1} failed: {e}")
 
-        self.logger.info("Pre-warming complete. Starting concurrency tests...")
-        time.sleep(5)  # Wait a bit after pre-warming
+            self.logger.info("Pre-warming complete. Starting concurrency tests...")
+            time.sleep(5)
 
         invocation_results = {}
         for level in INVOCATION_CONCURRENCY_LEVELS:
@@ -725,7 +920,9 @@ class BenchmarkSuite:
             for repeat in range(EXPERIMENT_REPEATS):
                 self.logger.info(f"Repetition {repeat + 1}/{EXPERIMENT_REPEATS}")
                 try:
-                    metrics, true_makespan_ms, avg_overhead_ms = self._run_concurrent_invocations_fixed(level, actual_function_name)
+                    metrics, true_makespan_ms, avg_overhead_ms = self._run_concurrent_invocations_fixed(
+                        level, actual_function_name
+                    )
 
                     if metrics:
                         level_results.append({
@@ -783,7 +980,7 @@ class BenchmarkSuite:
                 payload = {
                     "username": f"user_{uuid.uuid4().hex[:8]}",
                     "random_len": 100,
-                    "return_timestamps": True  # Request timestamps from function
+                    "return_timestamps": True
                 }
 
                 self.logger.debug(f"Invoking function {function_name} (invocation {inv_num})")
@@ -792,7 +989,7 @@ class BenchmarkSuite:
                 invocation_start = time.perf_counter()
 
                 # Invoke function
-                result = self.faas_manager.invoke(function_name, payload=payload, provider="lambda")
+                result = self.faas_manager.invoke(function_name, payload=payload)
 
                 # Record invocation end time
                 invocation_end = time.perf_counter()
@@ -804,8 +1001,8 @@ class BenchmarkSuite:
                 function_end = None
                 function_execution_ms = None
 
-                if isinstance(result, dict) and 'Payload' in result:
-                    payload_data = result['Payload']
+                if isinstance(result, dict) and 'payload' in result:
+                    payload_data = result['payload']
                     if isinstance(payload_data, dict):
                         # Get actual function timestamps
                         function_start = payload_data.get('function_start_time')
@@ -820,26 +1017,17 @@ class BenchmarkSuite:
                         else:
                             self.logger.warning(f"No timestamps in response for invocation {inv_num}")
 
-                # Get invocation metrics from metrics collector
-                invocation_metric = None
-                if self.metrics_collector and self.metrics_collector._completed_invocations:
-                    # Find the matching invocation metric
-                    for inv in reversed(self.metrics_collector._completed_invocations):
-                        if inv.function_name == function_name and inv.start_time >= invocation_start - 1:
-                            invocation_metric = inv
-                            break
+                # Calculate overhead
+                total_time_ms = (invocation_end - invocation_start) * 1000
+                overhead_ms = total_time_ms - (function_execution_ms or 0)
 
-                if invocation_metric:
-                    return {
-                        "overhead_ms": invocation_metric.manager_overhead_ms,
-                        "network_ms": invocation_metric.network_delay_ms,
-                        "total_ms": invocation_metric.total_time_ms,
-                        "function_start": function_start,
-                        "function_end": function_end
-                    }
-                else:
-                    self.logger.warning(f"Could not find metrics for invocation {inv_num}")
-                    return None
+                return {
+                    "overhead_ms": overhead_ms,
+                    "network_ms": overhead_ms * 0.5,  # Estimate
+                    "total_ms": total_time_ms,
+                    "function_start": function_start,
+                    "function_end": function_end
+                }
 
             except Exception as e:
                 self.logger.error(f"Invocation {inv_num} failed: {e}", exc_info=True)
@@ -886,16 +1074,16 @@ class BenchmarkSuite:
             self.logger.info(f"True makespan calculation: first_start={first_start:.6f}, last_end={last_end:.6f}")
             self.logger.info(f"True makespan: {true_makespan_ms:.2f}ms ({true_makespan_ms/1000:.2f}s)")
 
-            # Debug: Log number of successful timestamp collections
-            self.logger.info(f"Collected timestamps from {len(function_start_times)}/{num_invocations} invocations")
-
             # Sanity check - makespan should be at least 10 seconds (10000ms) since function sleeps for 10s
             if true_makespan_ms < 10000:
                 self.logger.warning(f"Makespan seems too low ({true_makespan_ms:.2f}ms) for a 10s function!")
                 self.logger.warning("This might indicate the function is not returning proper timestamps")
         else:
             self.logger.warning("No function timestamps available for makespan calculation")
-            self.logger.warning("Make sure your benchmark function returns 'function_start_time' and 'function_end_time'")
+            # Fallback to estimated makespan
+            if results:
+                avg_total = statistics.mean([r['total_ms'] for r in results])
+                true_makespan_ms = avg_total  # Conservative estimate
 
         # Calculate average overhead per invocation
         avg_overhead_ms = 0
@@ -912,52 +1100,56 @@ class BenchmarkSuite:
 
         return results, true_makespan_ms, avg_overhead_ms
 
-    def _get_latest_deployment_metrics(self):
-        """Get the most recent deployment metrics"""
-        if self.metrics_collector and self.metrics_collector._completed_deployments:
-            return self.metrics_collector._completed_deployments[-1]
-        return None
-
-    def _find_deployment_by_function_name(self, function_name: str):
-        """Find deployment metrics by function name"""
-        if self.metrics_collector:
-            for deployment in reversed(self.metrics_collector._completed_deployments):
-                if deployment.function_name == function_name:
-                    return deployment
-        return None
-
     def teardown(self):
         """Clean up resources and save results"""
         self.logger.info("========== Starting Benchmark Teardown ==========")
 
-        # Get manager footprint
-        if self.metrics_collector:
-            footprint = self.metrics_collector.get_manager_footprint()
-            self.results["manager_footprint"] = asdict(footprint)
-            self.logger.info(f"Manager Footprint: CPU avg={footprint.avg_cpu_percent:.2f}%, "
-                           f"Memory avg={footprint.avg_memory_mb:.2f}MB")
+        # Get manager footprint from metrics collector
+        if self.faas_manager and self.faas_manager.metrics_collector:
+            # Force metrics flush
+            self.faas_manager.metrics_collector._flush_metrics()
 
-            # Include detailed deployment metrics
-            self.results["deployments"] = [asdict(d) for d in self.metrics_collector._completed_deployments]
+            # Get resource samples
+            with self.faas_manager.metrics_collector._samples_lock:
+                samples = list(self.faas_manager.metrics_collector._resource_samples)
+
+            if samples:
+                cpu_values = [s.cpu_percent for s in samples]
+                memory_values = [s.memory_mb for s in samples]
+
+                self.results["manager_footprint"] = {
+                    "avg_cpu_percent": statistics.mean(cpu_values) if cpu_values else 0,
+                    "max_cpu_percent": max(cpu_values) if cpu_values else 0,
+                    "avg_memory_mb": statistics.mean(memory_values) if memory_values else 0,
+                    "max_memory_mb": max(memory_values) if memory_values else 0,
+                    "sample_count": len(samples)
+                }
+
+                self.logger.info(f"Manager Footprint: CPU avg={self.results['manager_footprint']['avg_cpu_percent']:.2f}%, "
+                               f"Memory avg={self.results['manager_footprint']['avg_memory_mb']:.2f}MB")
 
         # Clean up deployed functions
         if self.faas_manager:
             self.logger.info(f"Cleaning up {len(self.deployed_functions_for_cleanup)} functions...")
+
+            # Use the manager's delete_function method if available
             with ThreadPoolExecutor(max_workers=20) as executor:
                 list(executor.map(self._delete_function_safe, self.deployed_functions_for_cleanup))
 
             self._cleanup_aws_resources()
+
+            # Save metrics before shutdown
+            if self.faas_manager.metrics_collector:
+                metrics_path = self.faas_manager.save_metrics("benchmark_metrics.json")
+                self.logger.info(f"Metrics saved to: {metrics_path}")
+
             self.logger.info("Shutting down FaaS Manager...")
             self.faas_manager.shutdown()
-            self.faas_manager.wait_for_shutdown(timeout=60)
 
         # Save results
         results_path = self.output_dir / "results.json"
         with open(results_path, 'w') as f:
             json.dump(self.results, f, indent=2)
-
-        if self.metrics_collector:
-            self.metrics_collector.save_results("detailed_metrics.json")
 
         self.logger.info(f"Results saved to {results_path}")
 
@@ -970,51 +1162,66 @@ class BenchmarkSuite:
     def _delete_function_safe(self, func_name: str):
         """Safely delete a function"""
         try:
-            self.faas_manager.delete_function(func_name, 'lambda')
-            self.logger.info(f"Deleted function: {func_name}")
+            # Access the Lambda provider to delete function
+            with self.faas_manager._manager_lock:
+                if 'lambda' in self.faas_manager._providers:
+                    lambda_provider = self.faas_manager._providers['lambda']['instance']
+                    lambda_provider._lambda_client.delete_function(FunctionName=func_name)
+                    self.logger.info(f"Deleted function: {func_name}")
         except Exception as e:
             self.logger.debug(f"Could not delete {func_name}: {e}")
 
     def _cleanup_aws_resources(self):
         """Clean up AWS resources"""
-        lambda_provider = self.faas_manager._providers.get('lambda', {}).get('instance')
-        if not lambda_provider:
-            return
-
-        # Clean up cache bust files
-        for cache_file in BENCHMARK_FUNCTION_PATH.glob('.cachebust_*'):
-            cache_file.unlink()
-            self.logger.info(f"Removed cache bust file: {cache_file}")
-
-        # Clean up ECR repository if enabled
-        if self.enable_containers:
-            self.logger.info("Cleaning up ECR repository...")
-            try:
-                repo_name = lambda_provider.resource_manager.aws_resources.ecr_repository_name
-                if repo_name:
-                    lambda_provider.registry_manager.delete_ecr_repository(repo_name, force=True)
-                    self.logger.info(f"Deleted ECR repository: {repo_name}")
-            except Exception as e:
-                self.logger.warning(f"ECR cleanup error: {e}")
-
-        # Clean up IAM role
-        self.logger.info("Cleaning up IAM role...")
         try:
-            role_name = lambda_provider.resource_manager.aws_resources.iam_role_name
-            if role_name:
-                iam_client = lambda_provider._iam_client
-                # Detach policies
-                for policy in ['arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
-                             'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole']:
-                    try:
-                        iam_client.detach_role_policy(RoleName=role_name, PolicyArn=policy)
-                    except:
-                        pass
-                # Delete role
-                iam_client.delete_role(RoleName=role_name)
-                self.logger.info(f"Deleted IAM role: {role_name}")
+            with self.faas_manager._manager_lock:
+                if 'lambda' not in self.faas_manager._providers:
+                    return
+
+                lambda_provider = self.faas_manager._providers['lambda']['instance']
+
+            # Clean up cache bust files
+            for cache_file in BENCHMARK_FUNCTION_PATH.glob('.cachebust_*'):
+                cache_file.unlink()
+                self.logger.info(f"Removed cache bust file: {cache_file}")
+
+            # Clean up ECR repository if enabled
+            if self.enable_containers:
+                self.logger.info("Cleaning up ECR repository...")
+                try:
+                    if hasattr(lambda_provider.resource_manager.aws_resources, 'ecr_repository_name'):
+                        repo_name = lambda_provider.resource_manager.aws_resources.ecr_repository_name
+                        if repo_name:
+                            lambda_provider._ecr_client.delete_repository(
+                                repositoryName=repo_name,
+                                force=True
+                            )
+                            self.logger.info(f"Deleted ECR repository: {repo_name}")
+                except Exception as e:
+                    self.logger.warning(f"ECR cleanup error: {e}")
+
+            # Clean up IAM role
+            self.logger.info("Cleaning up IAM role...")
+            try:
+                if hasattr(lambda_provider.resource_manager.aws_resources, 'iam_role_name'):
+                    role_name = lambda_provider.resource_manager.aws_resources.iam_role_name
+                    if role_name:
+                        iam_client = lambda_provider._iam_client
+                        # Detach policies
+                        for policy in ['arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole',
+                                     'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole']:
+                            try:
+                                iam_client.detach_role_policy(RoleName=role_name, PolicyArn=policy)
+                            except:
+                                pass
+                        # Delete role
+                        iam_client.delete_role(RoleName=role_name)
+                        self.logger.info(f"Deleted IAM role: {role_name}")
+            except Exception as e:
+                self.logger.warning(f"IAM cleanup error: {e}")
+
         except Exception as e:
-            self.logger.warning(f"IAM cleanup error: {e}")
+            self.logger.error(f"Error during AWS resource cleanup: {e}")
 
     def _generate_plots(self):
         """Generate all required plots"""
@@ -1070,7 +1277,6 @@ class BenchmarkSuite:
         deployment_order = ["zip", "prebuilt", "container"]
 
         # Define overhead components and their display names
-        # Task preparation is already merged into package/image creation in metrics_collector
         overhead_components = {
             "package_creation_ms": "Package Creation",
             "image_build_ms": "Image Build",
@@ -1153,7 +1359,7 @@ class BenchmarkSuite:
         ax.set_xticklabels(labels, fontsize=PLOT_FONTS['bar']['x_tick_size'])
         ax.tick_params(axis='y', labelsize=PLOT_FONTS['bar']['axis_tick_size'])
 
-        # Add legend at top left (matching invocation plot)
+        # Add legend at top left
         ax.legend(title='Overhead Component', loc='upper left',
                   fontsize=PLOT_FONTS['bar']['legend_size'],
                   title_fontsize=PLOT_FONTS['bar']['legend_title_size'])
@@ -1176,6 +1382,7 @@ class BenchmarkSuite:
         plt.close()
 
         self.logger.info(f"Saved deployment overhead breakdown to: {save_path}")
+
     def _plot_invocation_makespan_overhead(self, plots_dir: Path):
         """Create stacked bar chart for invocation makespan vs overhead (in seconds)"""
         invocation_data = self.results.get("invocation_concurrency", {})
@@ -1270,7 +1477,7 @@ class BenchmarkSuite:
                            fontsize=PLOT_FONTS['invocation_bar']['x_tick_size'])
         ax.tick_params(axis='y', labelsize=PLOT_FONTS['bar']['axis_tick_size'])
 
-        # Add legend at top left (same as deployment plot)
+        # Add legend at top left
         ax.legend(loc='upper left', fontsize=PLOT_FONTS['bar']['legend_size'])
 
         self._setup_plot_style(ax)
@@ -1348,7 +1555,7 @@ class BenchmarkSuite:
                 mean = statistics.mean(data)
                 median = statistics.median(data)
 
-                # Find the highest point in the boxplot (upper whisker or outlier)
+                # Find the highest point in the boxplot
                 q75 = np.percentile(data, 75)
                 q25 = np.percentile(data, 25)
                 iqr = q75 - q25

@@ -1,0 +1,366 @@
+{
+  "summary": {
+    "deployment_stats": {},
+    "invocation_stats": {}
+  },
+  "raw_data": {
+    "deployments": [
+      {
+        "deployment_id": "dep-000001",
+        "function_name": "zip-test-64fe0d70",
+        "deployment_type": "zip",
+        "status": "failed",
+        "start_time": 38.602040666,
+        "preparation_end_time": 0.0,
+        "platform_api_start_time": 0.0,
+        "end_time": 38.602212875,
+        "total_time_ms": 0.17220899999870198,
+        "manager_overhead_ms": 0.0,
+        "packaging_overhead_ms": 0.0,
+        "platform_api_call_ms": 0.0,
+        "package_size_bytes": null,
+        "image_size_mb": null,
+        "error_message": "Lambda deployment failed: Cannot determine deployment type. Provide either:\n1. image with full URI (prebuilt-image)\n2. FAAS_SOURCE=/path/to/code (zip)\n3. FAAS_SOURCE + image (container-build)\n4. FAAS_INLINE_CODE='your code' (zip or container-build)"
+      },
+      {
+        "deployment_id": "dep-000002",
+        "function_name": "zip-test-81fd65c0",
+        "deployment_type": "zip",
+        "status": "failed",
+        "start_time": 43.640352416,
+        "preparation_end_time": 0.0,
+        "platform_api_start_time": 0.0,
+        "end_time": 43.640735333,
+        "total_time_ms": 0.38291700000314677,
+        "manager_overhead_ms": 0.0,
+        "packaging_overhead_ms": 0.0,
+        "platform_api_call_ms": 0.0,
+        "package_size_bytes": null,
+        "image_size_mb": null,
+        "error_message": "Lambda deployment failed: Cannot determine deployment type. Provide either:\n1. image with full URI (prebuilt-image)\n2. FAAS_SOURCE=/path/to/code (zip)\n3. FAAS_SOURCE + image (container-build)\n4. FAAS_INLINE_CODE='your code' (zip or container-build)"
+      },
+      {
+        "deployment_id": "dep-000003",
+        "function_name": "zip-test-f38d93c3",
+        "deployment_type": "zip",
+        "status": "failed",
+        "start_time": 48.655202666,
+        "preparation_end_time": 0.0,
+        "platform_api_start_time": 0.0,
+        "end_time": 48.655588583,
+        "total_time_ms": 0.3859169999955725,
+        "manager_overhead_ms": 0.0,
+        "packaging_overhead_ms": 0.0,
+        "platform_api_call_ms": 0.0,
+        "package_size_bytes": null,
+        "image_size_mb": null,
+        "error_message": "Lambda deployment failed: Cannot determine deployment type. Provide either:\n1. image with full URI (prebuilt-image)\n2. FAAS_SOURCE=/path/to/code (zip)\n3. FAAS_SOURCE + image (container-build)\n4. FAAS_INLINE_CODE='your code' (zip or container-build)"
+      },
+      {
+        "deployment_id": "dep-000004",
+        "function_name": "container-test-b293dbf0",
+        "deployment_type": "container-build",
+        "status": "failed",
+        "start_time": 58.738373625,
+        "preparation_end_time": 0.0,
+        "platform_api_start_time": 0.0,
+        "end_time": 58.73871125,
+        "total_time_ms": 0.3376250000002301,
+        "manager_overhead_ms": 0.0,
+        "packaging_overhead_ms": 0.0,
+        "platform_api_call_ms": 0.0,
+        "package_size_bytes": null,
+        "image_size_mb": null,
+        "error_message": "Lambda deployment failed: Cannot determine deployment type. Provide either:\n1. image with full URI (prebuilt-image)\n2. FAAS_SOURCE=/path/to/code (zip)\n3. FAAS_SOURCE + image (container-build)\n4. FAAS_INLINE_CODE='your code' (zip or container-build)"
+      }
+    ],
+    "invocations": [],
+    "resource_samples": [
+      {
+        "timestamp": 1755231399.767215,
+        "cpu_percent": 45.1,
+        "memory_mb": 229.78125
+      },
+      {
+        "timestamp": 1755231400.376213,
+        "cpu_percent": 0.1,
+        "memory_mb": 229.984375
+      },
+      {
+        "timestamp": 1755231400.982551,
+        "cpu_percent": 0.1,
+        "memory_mb": 229.984375
+      },
+      {
+        "timestamp": 1755231401.58983,
+        "cpu_percent": 0.2,
+        "memory_mb": 229.984375
+      },
+      {
+        "timestamp": 1755231402.200188,
+        "cpu_percent": 0.1,
+        "memory_mb": 229.984375
+      },
+      {
+        "timestamp": 1755231402.807223,
+        "cpu_percent": 0.2,
+        "memory_mb": 229.984375
+      },
+      {
+        "timestamp": 1755231403.413339,
+        "cpu_percent": 0.2,
+        "memory_mb": 229.984375
+      },
+      {
+        "timestamp": 1755231404.0172539,
+        "cpu_percent": 0.3,
+        "memory_mb": 229.96875
+      },
+      {
+        "timestamp": 1755231404.627033,
+        "cpu_percent": 0.1,
+        "memory_mb": 229.90625
+      },
+      {
+        "timestamp": 1755231405.2344692,
+        "cpu_percent": 0.2,
+        "memory_mb": 229.90625
+      },
+      {
+        "timestamp": 1755231405.8411,
+        "cpu_percent": 0.1,
+        "memory_mb": 229.90625
+      },
+      {
+        "timestamp": 1755231406.45017,
+        "cpu_percent": 0.2,
+        "memory_mb": 229.90625
+      },
+      {
+        "timestamp": 1755231407.05564,
+        "cpu_percent": 0.1,
+        "memory_mb": 229.90625
+      },
+      {
+        "timestamp": 1755231407.668145,
+        "cpu_percent": 0.2,
+        "memory_mb": 229.90625
+      },
+      {
+        "timestamp": 1755231408.274013,
+        "cpu_percent": 0.2,
+        "memory_mb": 229.90625
+      },
+      {
+        "timestamp": 1755231408.8841631,
+        "cpu_percent": 0.2,
+        "memory_mb": 229.90625
+      },
+      {
+        "timestamp": 1755231409.493182,
+        "cpu_percent": 0.2,
+        "memory_mb": 229.734375
+      },
+      {
+        "timestamp": 1755231410.1011999,
+        "cpu_percent": 4.1,
+        "memory_mb": 229.9375
+      },
+      {
+        "timestamp": 1755231410.707385,
+        "cpu_percent": 0.4,
+        "memory_mb": 230.234375
+      },
+      {
+        "timestamp": 1755231411.3163378,
+        "cpu_percent": 0.1,
+        "memory_mb": 230.234375
+      },
+      {
+        "timestamp": 1755231411.924273,
+        "cpu_percent": 0.2,
+        "memory_mb": 230.234375
+      },
+      {
+        "timestamp": 1755231412.532067,
+        "cpu_percent": 0.1,
+        "memory_mb": 230.234375
+      },
+      {
+        "timestamp": 1755231413.141176,
+        "cpu_percent": 0.2,
+        "memory_mb": 230.234375
+      },
+      {
+        "timestamp": 1755231413.74754,
+        "cpu_percent": 0.3,
+        "memory_mb": 230.234375
+      },
+      {
+        "timestamp": 1755231414.354069,
+        "cpu_percent": 0.2,
+        "memory_mb": 230.234375
+      },
+      {
+        "timestamp": 1755231414.963456,
+        "cpu_percent": 0.1,
+        "memory_mb": 230.234375
+      },
+      {
+        "timestamp": 1755231415.5726552,
+        "cpu_percent": 0.1,
+        "memory_mb": 230.25
+      },
+      {
+        "timestamp": 1755231416.181587,
+        "cpu_percent": 0.2,
+        "memory_mb": 230.25
+      },
+      {
+        "timestamp": 1755231416.785363,
+        "cpu_percent": 0.3,
+        "memory_mb": 230.25
+      },
+      {
+        "timestamp": 1755231417.394262,
+        "cpu_percent": 0.1,
+        "memory_mb": 230.25
+      },
+      {
+        "timestamp": 1755231417.998969,
+        "cpu_percent": 0.0,
+        "memory_mb": 230.25
+      },
+      {
+        "timestamp": 1755231418.6088161,
+        "cpu_percent": 0.1,
+        "memory_mb": 230.25
+      },
+      {
+        "timestamp": 1755231419.217691,
+        "cpu_percent": 0.4,
+        "memory_mb": 230.25
+      },
+      {
+        "timestamp": 1755231419.8224618,
+        "cpu_percent": 0.3,
+        "memory_mb": 230.25
+      },
+      {
+        "timestamp": 1755231420.42866,
+        "cpu_percent": 0.0,
+        "memory_mb": 230.265625
+      },
+      {
+        "timestamp": 1755231421.038462,
+        "cpu_percent": 0.1,
+        "memory_mb": 230.265625
+      },
+      {
+        "timestamp": 1755231421.642262,
+        "cpu_percent": 0.2,
+        "memory_mb": 230.265625
+      },
+      {
+        "timestamp": 1755231422.248287,
+        "cpu_percent": 0.4,
+        "memory_mb": 230.265625
+      },
+      {
+        "timestamp": 1755231422.854112,
+        "cpu_percent": 0.2,
+        "memory_mb": 230.265625
+      },
+      {
+        "timestamp": 1755231423.4612858,
+        "cpu_percent": 0.2,
+        "memory_mb": 230.265625
+      },
+      {
+        "timestamp": 1755231424.0679061,
+        "cpu_percent": 0.2,
+        "memory_mb": 230.265625
+      },
+      {
+        "timestamp": 1755231424.675461,
+        "cpu_percent": 0.1,
+        "memory_mb": 216.5625
+      },
+      {
+        "timestamp": 1755231425.283423,
+        "cpu_percent": 19.8,
+        "memory_mb": 216.609375
+      },
+      {
+        "timestamp": 1755231425.89111,
+        "cpu_percent": 0.2,
+        "memory_mb": 216.625
+      },
+      {
+        "timestamp": 1755231426.4996119,
+        "cpu_percent": 0.2,
+        "memory_mb": 216.625
+      },
+      {
+        "timestamp": 1755231427.106383,
+        "cpu_percent": 0.2,
+        "memory_mb": 216.625
+      },
+      {
+        "timestamp": 1755231427.7134569,
+        "cpu_percent": 0.2,
+        "memory_mb": 216.625
+      },
+      {
+        "timestamp": 1755231428.316308,
+        "cpu_percent": 0.3,
+        "memory_mb": 216.625
+      },
+      {
+        "timestamp": 1755231428.9256032,
+        "cpu_percent": 0.2,
+        "memory_mb": 216.28125
+      },
+      {
+        "timestamp": 1755231429.5360909,
+        "cpu_percent": 0.2,
+        "memory_mb": 216.25
+      },
+      {
+        "timestamp": 1755231430.1417432,
+        "cpu_percent": 0.1,
+        "memory_mb": 216.25
+      },
+      {
+        "timestamp": 1755231430.745591,
+        "cpu_percent": 0.1,
+        "memory_mb": 216.109375
+      },
+      {
+        "timestamp": 1755231431.354058,
+        "cpu_percent": 0.3,
+        "memory_mb": 211.421875
+      },
+      {
+        "timestamp": 1755231431.963635,
+        "cpu_percent": 0.1,
+        "memory_mb": 195.984375
+      },
+      {
+        "timestamp": 1755231432.572879,
+        "cpu_percent": 0.1,
+        "memory_mb": 192.734375
+      },
+      {
+        "timestamp": 1755231433.181702,
+        "cpu_percent": 0.1,
+        "memory_mb": 76.390625
+      },
+      {
+        "timestamp": 1755231433.793476,
+        "cpu_percent": 0.1,
+        "memory_mb": 76.421875
+      }
+    ]
+  }
+}

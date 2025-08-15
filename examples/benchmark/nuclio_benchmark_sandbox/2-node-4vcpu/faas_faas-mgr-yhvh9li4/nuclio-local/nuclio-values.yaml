@@ -1,4 +1,0 @@
-controller.enabled: true
-dashboard.enabled: true
-dashboard.nodePort: 8070
-rbac.create: true

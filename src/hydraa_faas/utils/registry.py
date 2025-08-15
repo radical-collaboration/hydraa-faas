@@ -12,6 +12,7 @@ Key Features:
 - Simplifies ECR authentication by delegating token management to boto3.
 - Tracks detailed metrics for build and push operations from structured SDK output.
 - Thread-safe for use in concurrent environments.
+- Parallel builds for images with the same base layer.
 
 Example:
     To build and push an image to ECR::
@@ -37,6 +38,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+from collections import defaultdict
 
 import docker
 from docker.errors import APIError, BuildError
@@ -96,13 +98,15 @@ class RegistryManager:
         docker_client: An instance of the Docker SDK client.
     """
 
-    def __init__(self, logger: Optional[Any] = None, aws_clients: Optional[Dict[str, Any]] = None):
+    def __init__(self, logger: Optional[Any] = None, aws_clients: Optional[Dict[str, Any]] = None,
+                 build_workers: int = 20):
         """Initializes the RegistryManager.
 
         Args:
             logger: An optional logger instance for logging messages.
             aws_clients: An optional dictionary containing boto3 clients,
                          e.g., {'ecr': boto3.client('ecr')}.
+            build_workers: Number of workers for parallel builds (default 20).
 
         Raises:
             FaasException: If the Docker daemon is not running or accessible.
@@ -120,9 +124,15 @@ class RegistryManager:
             self._log_error(f"Failed to connect to Docker daemon: {e}")
             raise FaasException("Docker daemon is not running or accessible.")
 
-        self.executor = ThreadPoolExecutor(max_workers=10)
+        # Thread pool for parallel builds
+        self.build_executor = ThreadPoolExecutor(max_workers=build_workers, thread_name_prefix="Docker_Build")
+
         self._last_build_metrics: Optional[BuildMetrics] = None
         self._last_push_metrics: Optional[PushMetrics] = None
+
+        # Cache for ECR tokens (valid for 12 hours)
+        self._ecr_token_cache: Dict[str, Dict[str, Any]] = {}
+        self._ecr_token_lock = threading.Lock()
 
     def _log_info(self, message: str):
         """Logs an info message."""
@@ -201,6 +211,7 @@ class RegistryManager:
 
         push_start = time.perf_counter()
         layers_pushed = 0
+        push_errors = []
         try:
             self._log_info(f"Pushing image: {tagged_uri}")
             push_log_stream = self.docker_client.images.push(tagged_uri, stream=True, decode=True)
@@ -208,8 +219,16 @@ class RegistryManager:
                 self._log_debug(f"Push output: {line}")
                 if 'status' in line and line['status'] == 'Pushed':
                     layers_pushed += 1
+                elif 'error' in line or 'errorDetail' in line:
+                    error_msg = line.get('error', line.get('errorDetail', {}).get('message', 'Unknown error'))
+                    push_errors.append(error_msg)
+                    self._log_error(f"Push error: {error_msg}")
         except APIError as e:
             raise FaasException(f"Docker push failed: {e}")
+
+        # Check if push actually succeeded
+        if push_errors:
+            raise FaasException(f"Docker push failed with errors: {'; '.join(push_errors)}")
 
         push_time_ms = (time.perf_counter() - push_start) * 1000
         push_metrics = PushMetrics(push_time_ms=push_time_ms, layers_pushed=layers_pushed)
@@ -244,6 +263,49 @@ class RegistryManager:
 
         self._log_info(f"Successfully built and pushed image: {full_image_uri}")
         return full_image_uri, build_metrics, push_metrics
+
+    def build_images_parallel(self, build_requests: List[Dict[str, str]]) -> List[
+        Tuple[str, BuildMetrics, Optional[Exception]]]:
+        """Build multiple images in parallel, grouped by base image.
+
+        Args:
+            build_requests: List of dicts with 'source_path', 'image_uri', and optional 'base_image'
+
+        Returns:
+            List of tuples (image_uri, metrics, error) for each build request.
+        """
+        # Group by base image
+        builds_by_base = defaultdict(list)
+        for req in build_requests:
+            base_image = req.get('base_image', 'default')
+            builds_by_base[base_image].append(req)
+
+        results = []
+        all_futures = {}
+
+        # Build groups in parallel
+        for base_image, group in builds_by_base.items():
+            self._log_info(f"Building {len(group)} images with base: {base_image}")
+
+            for req in group:
+                future = self.build_executor.submit(
+                    self._docker_build,
+                    req['source_path'],
+                    req['image_uri']
+                )
+                all_futures[future] = req['image_uri']
+
+        # Collect results
+        for future in as_completed(all_futures):
+            image_uri = all_futures[future]
+            try:
+                metrics = future.result()
+                results.append((image_uri, metrics, None))
+            except Exception as e:
+                self._log_error(f"Failed to build {image_uri}: {e}")
+                results.append((image_uri, None, e))
+
+        return results
 
     def create_ecr_repository(self, repository_name: str) -> str:
         """Creates an ECR repository if it doesn't exist.
@@ -286,6 +348,46 @@ class RegistryManager:
         layers_count = 0
         self._log_info(f"Building Docker image: {image_uri} from {source_path}")
 
+        # For multi-platform builds, we need to use buildx
+        # First check if we're on a different architecture than target
+        import platform as platform_module
+        if platform_module.machine() in ['arm64', 'aarch64']:
+            self._log_info("Detected ARM architecture, using buildx for linux/amd64 build")
+            # Use subprocess for buildx as Docker SDK doesn't fully support it
+            import subprocess
+            build_cmd = [
+                'docker', 'buildx', 'build',
+                '--platform', 'linux/amd64',
+                '--load',  # Load into local docker
+                '-t', image_uri,
+                source_path
+            ]
+
+            try:
+                result = subprocess.run(build_cmd, capture_output=True, text=True, check=True)
+                self._log_debug(f"Buildx output: {result.stdout}")
+
+                # Get the image object for size calculation
+                image = self.docker_client.images.get(image_uri)
+                image_size_bytes = image.attrs.get('Size')
+
+                build_time_ms = (time.perf_counter() - build_start) * 1000
+
+                metrics = BuildMetrics(
+                    build_time_ms=build_time_ms,
+                    image_size_bytes=image_size_bytes,
+                    layers_count=1,  # Can't easily get from buildx
+                    cache_hits=0
+                )
+
+                with self._metrics_lock:
+                    self._last_build_metrics = metrics
+                return metrics
+
+            except subprocess.CalledProcessError as e:
+                raise FaasException(f"Docker buildx failed: {e.stderr}")
+
+        # Original build for same architecture
         build_args = {'DOCKER_BUILDKIT': '0'}  # Disable BuildKit for Lambda compatibility
 
         try:
@@ -294,8 +396,7 @@ class RegistryManager:
                 tag=image_uri,
                 rm=True,
                 forcerm=True,
-                buildargs=build_args,
-                platform='linux/amd64'
+                buildargs=build_args
             )
 
             for line in build_log_stream:
@@ -327,7 +428,7 @@ class RegistryManager:
             raise FaasException(f"Docker API error during build: {e}")
 
     def _login_ecr(self, config: RegistryConfig) -> bool:
-        """Logs in to Amazon ECR.
+        """Logs in to Amazon ECR with token caching.
 
         Args:
             config: The ECR registry configuration.
@@ -337,15 +438,66 @@ class RegistryManager:
         """
         if 'ecr' not in self._aws_clients:
             raise ECRException("ECR client not provided for login.")
+
         ecr_client = self._aws_clients['ecr']
+
+        # Check token cache
+        with self._ecr_token_lock:
+            cache_key = config.region or 'default'
+            cached_token = self._ecr_token_cache.get(cache_key)
+
+            if cached_token:
+                # Check if token is still valid (11 hours to be safe)
+                if time.time() - cached_token['timestamp'] < (11 * 60 * 60):
+                    self._log_info("Using cached ECR token")
+                    return self._docker_login_with_token(cached_token)
+
         try:
+            # Get fresh authorization token
             auth_data = ecr_client.get_authorization_token()['authorizationData'][0]
             token = auth_data['authorizationToken']
             registry_url = auth_data['proxyEndpoint']
+
+            # Decode token
             username, password = base64.b64decode(token).decode('utf-8').split(':', 1)
-            return self._docker_login(username, password, registry_url)
+
+            # Cache token
+            with self._ecr_token_lock:
+                self._ecr_token_cache[cache_key] = {
+                    'username': username,
+                    'password': password,
+                    'registry': registry_url.replace('https://', '').replace('http://', ''),
+                    'timestamp': time.time()
+                }
+
+            # Extract registry without https://
+            registry = registry_url.replace('https://', '').replace('http://', '')
+
+            # Use Docker SDK login with registry parameter
+            self.docker_client.login(
+                username=username,
+                password=password,
+                registry=registry,
+                reauth=True  # Force re-authentication
+            )
+            self._log_info(f"Docker login to {registry} successful.")
+            return True
         except Exception as e:
             raise ECRException(f"Failed to get ECR authorization: {e}")
+
+    def _docker_login_with_token(self, token_data: Dict[str, Any]) -> bool:
+        """Login with cached token data."""
+        try:
+            self.docker_client.login(
+                username=token_data['username'],
+                password=token_data['password'],
+                registry=token_data['registry'],
+                reauth=True
+            )
+            return True
+        except Exception:
+            # Token might be expired, return False to get new one
+            return False
 
     def _docker_login(self, username: str, password: str, registry_url: str) -> bool:
         """Logs in to a Docker registry using the Docker SDK.
@@ -414,3 +566,8 @@ class RegistryManager:
                     if uri.startswith(url_prefix):
                         return name
         return None
+
+    def shutdown(self) -> None:
+        """Shutdown the registry manager and cleanup resources."""
+        self.build_executor.shutdown(wait=True)
+        self._log_info("Registry manager shutdown complete")
