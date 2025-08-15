@@ -13,6 +13,7 @@ Key Features:
 - Optional periodic saving to prevent data loss during long runs.
 - Continuous resource monitoring of the FaaS manager process.
 - Automatic sample aggregation to prevent memory growth.
+- Lock-free buffering for high-performance metrics collection.
 
 Example:
     To use the collector in a benchmark::
@@ -133,14 +134,26 @@ class MetricsCollector:
         output_dir: The directory where metrics files will be saved.
     """
 
-    def __init__(self, output_dir: str = "./metrics", save_interval_seconds: Optional[int] = None):
+    def __init__(self, output_dir: str = "./metrics", save_interval_seconds: Optional[int] = None,
+                 enable_collection: bool = True):
         """Initializes the MetricsCollector.
 
         Args:
             output_dir: The directory to save metrics files.
             save_interval_seconds: If set, metrics will be saved to disk
                                    periodically at this interval.
+            enable_collection: If False, all metric collection is disabled.
         """
+        self.enable_collection = enable_collection
+
+        if not self.enable_collection:
+            # Create minimal structure to avoid errors
+            self.output_dir = Path(output_dir)
+            self.output_dir.mkdir(exist_ok=True)
+            self._deployments = {}
+            self._invocations = {}
+            return
+
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
 
@@ -163,9 +176,8 @@ class MetricsCollector:
         self._saver_thread: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
 
-        # Metrics batching
-        self._metrics_buffer: List[MetricsUpdate] = []
-        self._buffer_lock = threading.Lock()
+        # Efficient lock-free metrics buffering using deque
+        self._metrics_buffer = deque(maxlen=10000)  # Circular buffer
         self._flush_interval = 1.0  # seconds
         self._flush_thread: Optional[threading.Thread] = None
 
@@ -190,6 +202,9 @@ class MetricsCollector:
         Returns:
             A unique ID for this deployment operation.
         """
+        if not self.enable_collection:
+            return f"dep-disabled-{time.time()}"
+
         with self._counter_lock:
             self._deployment_counter += 1
             deployment_id = f"dep-{self._deployment_counter:06d}"
@@ -201,13 +216,13 @@ class MetricsCollector:
             start_time=time.perf_counter()
         )
 
-        # Buffer the update
+        # Lock-free append to buffer
         update = MetricsUpdate(
             update_type='deployment_start',
             data={'deployment_id': deployment_id, 'deployment': asdict(deployment)},
             timestamp=time.time()
         )
-        self._buffer_update(update)
+        self._metrics_buffer.append(update)  # Thread-safe append to deque
 
         return deployment_id
 
@@ -219,6 +234,9 @@ class MetricsCollector:
             status: The final status ('success' or 'failed').
             **kwargs: Additional metrics (e.g., package_size_bytes, error_message).
         """
+        if not self.enable_collection:
+            return
+
         update = MetricsUpdate(
             update_type='deployment_complete',
             data={
@@ -229,7 +247,7 @@ class MetricsCollector:
             },
             timestamp=time.time()
         )
-        self._buffer_update(update)
+        self._metrics_buffer.append(update)  # Lock-free append
 
     def start_invocation(self, function_name: str, payload_size: int = 0) -> str:
         """Starts tracking a new function invocation.
@@ -241,6 +259,9 @@ class MetricsCollector:
         Returns:
             A unique ID for this invocation operation.
         """
+        if not self.enable_collection:
+            return f"inv-disabled-{time.time()}"
+
         with self._counter_lock:
             self._invocation_counter += 1
             invocation_id = f"inv-{self._invocation_counter:06d}"
@@ -252,13 +273,13 @@ class MetricsCollector:
             payload_size_bytes=payload_size
         )
 
-        # Buffer the update
+        # Lock-free append to buffer
         update = MetricsUpdate(
             update_type='invocation_start',
             data={'invocation_id': invocation_id, 'invocation': asdict(invocation)},
             timestamp=time.time()
         )
-        self._buffer_update(update)
+        self._metrics_buffer.append(update)  # Thread-safe append to deque
 
         return invocation_id
 
@@ -270,6 +291,9 @@ class MetricsCollector:
             status: The final status ('success' or 'failed').
             **kwargs: Additional metrics (e.g., cold_start, error_message).
         """
+        if not self.enable_collection:
+            return
+
         update = MetricsUpdate(
             update_type='invocation_complete',
             data={
@@ -280,12 +304,7 @@ class MetricsCollector:
             },
             timestamp=time.time()
         )
-        self._buffer_update(update)
-
-    def _buffer_update(self, update: MetricsUpdate) -> None:
-        """Buffer a metrics update for batch processing."""
-        with self._buffer_lock:
-            self._metrics_buffer.append(update)
+        self._metrics_buffer.append(update)  # Lock-free append
 
     def _start_flush_thread(self) -> None:
         """Start thread to periodically flush metrics."""
@@ -299,16 +318,22 @@ class MetricsCollector:
         self._flush_thread.start()
 
     def _flush_metrics(self) -> None:
-        """Flush buffered metrics updates."""
-        with self._buffer_lock:
-            if not self._metrics_buffer:
-                return
+        """Flush buffered metrics updates efficiently."""
+        if not self._metrics_buffer:
+            return
 
-            updates = self._metrics_buffer.copy()
-            self._metrics_buffer.clear()
+        # Process all available updates in one batch
+        updates_to_process = []
+        try:
+            while True:
+                update = self._metrics_buffer.popleft()
+                updates_to_process.append(update)
+        except IndexError:
+            # Buffer is empty
+            pass
 
         # Process updates in batch
-        for update in updates:
+        for update in updates_to_process:
             self._apply_update(update)
 
     def _apply_update(self, update: MetricsUpdate) -> None:
@@ -334,13 +359,13 @@ class MetricsCollector:
                     deployment.total_time_ms = (deployment.end_time - deployment.start_time) * 1000
                     if deployment.platform_api_start_time > 0:
                         deployment.manager_overhead_ms = (
-                                                                     deployment.platform_api_start_time - deployment.start_time) * 1000
+                                                                 deployment.platform_api_start_time - deployment.start_time) * 1000
                         deployment.platform_api_call_ms = (
-                                                                      deployment.end_time - deployment.platform_api_start_time) * 1000
+                                                                  deployment.end_time - deployment.platform_api_start_time) * 1000
 
                     if deployment.preparation_end_time > 0:
                         deployment.packaging_overhead_ms = (
-                                                                       deployment.preparation_end_time - deployment.start_time) * 1000
+                                                                   deployment.preparation_end_time - deployment.start_time) * 1000
 
         elif update.update_type == 'invocation_start':
             with self._invocations_lock:
@@ -368,7 +393,7 @@ class MetricsCollector:
                         invocation.makespan_ms = update.data['kwargs'].get('function_execution_ms', 0)
 
                         platform_call_duration = (
-                                                             invocation.platform_api_end_time - invocation.pre_invoke_end_time) * 1000
+                                                         invocation.platform_api_end_time - invocation.pre_invoke_end_time) * 1000
                         invocation.network_delay_ms = max(0, platform_call_duration - invocation.makespan_ms)
 
     def _start_aggregation_thread(self) -> None:
@@ -407,6 +432,9 @@ class MetricsCollector:
 
     def get_deployment_statistics(self) -> pd.DataFrame:
         """Calculates and returns deployment statistics as a pandas DataFrame."""
+        if not self.enable_collection:
+            return pd.DataFrame()
+
         # Flush any pending updates first
         self._flush_metrics()
 
@@ -427,6 +455,9 @@ class MetricsCollector:
 
     def get_invocation_statistics(self) -> pd.DataFrame:
         """Calculates and returns invocation statistics as a pandas DataFrame."""
+        if not self.enable_collection:
+            return pd.DataFrame()
+
         # Flush any pending updates first
         self._flush_metrics()
 
@@ -438,15 +469,17 @@ class MetricsCollector:
         df = pd.DataFrame([asdict(i) for i in completed])
         cold_start_percentage = (df['cold_start'].sum() / len(df)) * 100
 
-        summary = df.agg(
-            count=('invocation_id', 'count'),
-            avg_total_ms=('total_time_ms', 'mean'),
-            p90_total_ms=('total_time_ms', lambda x: x.quantile(0.9)),
-            avg_overhead_ms=('manager_overhead_ms', 'mean'),
-            avg_makespan_ms=('makespan_ms', 'mean'),
-            avg_network_delay_ms=('network_delay_ms', 'mean')
-        ).to_frame().T
-        summary['cold_start_percentage'] = cold_start_percentage
+        # Fix the aggregation - result is already a Series, not a DataFrame
+        summary = pd.DataFrame({
+            'count': [len(df)],
+            'avg_total_ms': [df['total_time_ms'].mean()],
+            'p90_total_ms': [df['total_time_ms'].quantile(0.9)],
+            'avg_overhead_ms': [df['manager_overhead_ms'].mean()],
+            'avg_makespan_ms': [df['makespan_ms'].mean()],
+            'avg_network_delay_ms': [df['network_delay_ms'].mean()],
+            'cold_start_percentage': [cold_start_percentage]
+        })
+
         return summary
 
     def save_results(self, filename: str = "benchmark_results.json") -> Path:
@@ -458,6 +491,13 @@ class MetricsCollector:
         Returns:
             The path to the saved file.
         """
+        if not self.enable_collection:
+            # Create empty results file
+            filepath = self.output_dir / filename
+            with open(filepath, 'w') as f:
+                json.dump({"message": "Metrics collection was disabled"}, f, indent=2)
+            return filepath
+
         # Flush any pending updates first
         self._flush_metrics()
 
@@ -483,6 +523,9 @@ class MetricsCollector:
 
     def shutdown(self) -> None:
         """Shuts down the metrics collector and its background threads."""
+        if not self.enable_collection:
+            return
+
         self._log_info("Shutting down metrics collector...")
 
         # Flush any pending updates
@@ -504,12 +547,18 @@ class MetricsCollector:
 
     def _start_resource_monitoring(self) -> None:
         """Starts the background thread for resource monitoring."""
+        if not self.enable_collection:
+            return
+
         self._monitor_stop.clear()
         self._monitor_thread = threading.Thread(target=self._monitor_resources, daemon=True, name="ResourceMonitor")
         self._monitor_thread.start()
 
     def _stop_resource_monitoring(self) -> None:
         """Stops the resource monitoring thread."""
+        if not self.enable_collection:
+            return
+
         self._monitor_stop.set()
         if self._monitor_thread and self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=2)

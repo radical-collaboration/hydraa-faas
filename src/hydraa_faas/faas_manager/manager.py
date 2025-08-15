@@ -1,24 +1,26 @@
 # -*- coding: utf-8 -*-
-"""FaaS Manager - Refactored to better integrate with HYDRA architecture.
+"""FaaS Manager - Improved with integrated metrics collection.
 
 This module serves as the central orchestrator for FaaS providers, following
-HYDRA's established patterns for service managers.
+HYDRA's established patterns for service managers with comprehensive metrics.
 """
 
 import os
+import json
 import queue
 import threading
 import uuid
-
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import radical.utils as ru
-
 from hydraa import Task, proxy
 from hydraa.services.caas_manager.utils import misc
 
 from ..utils.exceptions import FaasException, InvocationException
+from ..utils.metrics_collector import MetricsCollector
+from ..utils import packaging  # Import packaging module for shutdown
 from .aws_lambda import AwsLambda
 from .custom_faas import NuclioProvider
 
@@ -27,30 +29,45 @@ LAMBDA = 'lambda'
 NUCLIO = 'nuclio'
 
 
-class FaasManager:
-    """Orchestrates various FaaS providers following HYDRA patterns.
+class FaaSManager:
+    """Orchestrates various FaaS providers with integrated metrics collection.
 
     This manager integrates with HYDRA's ServiceManager and uses existing
-    HYDRA components without modification.
+    HYDRA components without modification, while providing comprehensive
+    metrics collection and analysis.
     """
 
     def __init__(self,
                  proxy_mgr: proxy,
                  vms: Optional[List[Any]] = None,
                  asynchronous: bool = True,
-                 auto_terminate: bool = True):
-        """Initializes the FaasManager following HYDRA patterns.
+                 auto_terminate: bool = True,
+                 deployment_workers: int = 200,
+                 invocation_workers: int = 50,
+                 packaging_workers: int = 50,
+                 enable_metrics: bool = True,
+                 metrics_save_interval: int = 60):
+        """Initializes the FaaS Manager with integrated metrics.
 
         Args:
             proxy_mgr: HYDRA's proxy manager for credentials.
             vms: List of VM definitions for infrastructure.
             asynchronous: If True, tasks run in background.
             auto_terminate: If True, cleanup resources on shutdown.
+            deployment_workers: Max workers for deployment operations (default 200).
+            invocation_workers: Max workers for invocation operations (default 50).
+            packaging_workers: Max workers for packaging operations (default 50).
+            enable_metrics: If True, collect performance metrics (default True).
+            metrics_save_interval: Interval in seconds to save metrics (default 60).
         """
         self._proxy = proxy_mgr
         self.vms = vms or []
         self.asynchronous = asynchronous
         self.auto_terminate = auto_terminate
+        self.deployment_workers = deployment_workers
+        self.invocation_workers = invocation_workers
+        self.packaging_workers = packaging_workers
+        self.enable_metrics = enable_metrics
 
         # HYDRA ServiceManager expectations
         self.incoming_q = queue.Queue()
@@ -65,20 +82,36 @@ class FaasManager:
         self._terminate = threading.Event()
         self._worker_thread: Optional[threading.Thread] = None
         self._task_to_function_map: Dict[str, str] = {}
-        self._function_to_provider: Dict[str, str] = {}
 
-        # Thread safety locks
-        self._function_map_lock = threading.RLock()
-        self._provider_lock = threading.RLock()
+        # Performance optimization: function to provider cache
+        self._function_to_provider_cache: Dict[str, str] = {}
 
-        # Thread pool for provider initialization
-        self.executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="FaaS_Init")
+        # Thread safety with single RLock
+        self._manager_lock = threading.RLock()
+
+        # Separate thread pools for deployments and invocations
+        self.deployment_executor = ThreadPoolExecutor(
+            max_workers=deployment_workers,
+            thread_name_prefix="FaaS_Deploy"
+        )
+
+        self.invocation_executor = ThreadPoolExecutor(
+            max_workers=invocation_workers,
+            thread_name_prefix="FaaS_Invoke"
+        )
 
         # Lazy loading for providers
         self._provider_factories = {}
 
+        # Track pending deployments for async mode
+        self._pending_deployments = []
+
+        # Integrated metrics collector
+        self.metrics_collector = None
+        self._metrics_save_interval = metrics_save_interval
+
     def start(self, sandbox: str) -> None:
-        """Starts the FaaS Manager following HYDRA's pattern.
+        """Starts the FaaS Manager with metrics collection.
 
         Called by ServiceManager to initialize the service.
 
@@ -98,20 +131,24 @@ class FaasManager:
         # Use HYDRA's profiler
         self.profiler = ru.Profiler(name='FaasManager', path=self.sandbox)
 
+        # Initialize metrics collector if enabled
+        if self.enable_metrics:
+            metrics_dir = os.path.join(self.sandbox, 'metrics')
+            self.metrics_collector = MetricsCollector(
+                output_dir=metrics_dir,
+                save_interval_seconds=self._metrics_save_interval,
+                enable_collection=True
+            )
+            self.logger.trace(f"Metrics collection enabled, saving to {metrics_dir}")
+
         self.logger.trace(f"Starting FaaS manager in {self.sandbox}")
         self.profiler.prof('faas_start', uid='manager')
 
         # Initialize provider factories (lazy loading)
         self._initialize_provider_factories()
 
-        # Start worker thread for async processing
-        if self.asynchronous:
-            self._worker_thread = threading.Thread(
-                target=self._worker,
-                name='FaasWorker',
-                daemon=True
-            )
-            self._worker_thread.start()
+        # Note: Worker thread is no longer needed for async mode
+        # as we submit directly to thread pool
 
         self.status = True
         self.profiler.prof('faas_started', uid='manager')
@@ -138,7 +175,7 @@ class FaasManager:
 
     def _get_provider(self, name: str) -> Dict[str, Any]:
         """Get or create a provider instance (lazy loading)."""
-        with self._provider_lock:
+        with self._manager_lock:
             if name not in self._providers and name in self._provider_factories:
                 try:
                     provider_info = self._provider_factories[name]()
@@ -189,7 +226,11 @@ class FaasManager:
             auto_terminate=self.auto_terminate,
             log=self.logger,
             resource_config=infra_config,
-            profiler=self.profiler
+            profiler=self.profiler,
+            deployment_workers=self.deployment_workers,
+            invocation_workers=self.invocation_workers,
+            packaging_workers=self.packaging_workers,
+            enable_metrics=self.enable_metrics
         )
         return {'instance': provider, 'type': 'lambda'}
 
@@ -210,26 +251,16 @@ class FaasManager:
             auto_terminate=self.auto_terminate,
             log=self.logger,
             resource_config=infra_config,
-            profiler=self.profiler
+            profiler=self.profiler,
+            deployment_workers=self.deployment_workers,
+            invocation_workers=self.invocation_workers,
+            enable_metrics=self.enable_metrics
         )
         return {'instance': provider, 'type': 'nuclio'}
 
-    def _worker(self) -> None:
-        """Worker thread for processing tasks asynchronously."""
-        self.logger.trace("FaaS worker thread started")
-
-        while not self._terminate.is_set():
-            try:
-                task = self.incoming_q.get(timeout=1.0)
-                if task:
-                    self._process_task(task)
-            except queue.Empty:
-                continue
-            except Exception as e:
-                self.logger.error(f"Worker error: {e}")
-
     def _process_task(self, task: Task) -> None:
-        """Process a single task."""
+        """Process a single task with metrics tracking."""
+        deployment_id = None
         try:
             # Mark task as running using Future interface
             task.set_running_or_notify_cancel()
@@ -246,15 +277,34 @@ class FaasManager:
             provider_dict = self._get_provider(provider_name)
             provider = provider_dict['instance']
 
+            # Start deployment metrics
+            if self.metrics_collector:
+                deployment_type = self._determine_deployment_type(task)
+                deployment_id = self.metrics_collector.start_deployment(
+                    function_name=task.name or f"task-{task.id}",
+                    deployment_type=deployment_type
+                )
+
             # Deploy the function
-            self.profiler.prof('deploy_start', uid=task.id)
+            if self.enable_metrics:
+                self.profiler.prof('deploy_start', uid=task.id)
+
             function_id = provider.deploy_function(task)
-            self.profiler.prof('deploy_end', uid=task.id)
+
+            if self.enable_metrics:
+                self.profiler.prof('deploy_end', uid=task.id)
 
             # Track deployment with thread safety
-            with self._function_map_lock:
+            with self._manager_lock:
                 self._task_to_function_map[task.id] = function_id
-                self._function_to_provider[function_id] = provider_name
+                self._function_to_provider_cache[function_id] = provider_name
+
+            # Complete deployment metrics
+            if self.metrics_collector and deployment_id:
+                self.metrics_collector.complete_deployment(
+                    deployment_id,
+                    status='success'
+                )
 
             # Set result using Future interface
             task.set_result(function_id)
@@ -264,41 +314,100 @@ class FaasManager:
             self.outgoing_q.put(msg)
 
         except Exception as e:
+            # Complete deployment metrics with failure
+            if self.metrics_collector and deployment_id:
+                self.metrics_collector.complete_deployment(
+                    deployment_id,
+                    status='failed',
+                    error_message=str(e)
+                )
+
             # Use Future interface for exceptions
             task.set_exception(e)
             self.logger.error(f"Failed to process task {task.id}: {e}")
             self.outgoing_q.put(f"Task {task.id} failed: {e}")
 
+    def _determine_deployment_type(self, task: Task) -> str:
+        """Determine deployment type from task configuration."""
+        faas_config = self._extract_faas_config(task)
+
+        # Check if it's a prebuilt image
+        if hasattr(task, 'image') and task.image and self._is_full_image_uri(task.image):
+            return 'prebuilt-image'
+
+        # Check for source + image = container build
+        if faas_config.get('source') and hasattr(task, 'image') and task.image:
+            return 'container-build'
+
+        # Check for source only = zip
+        if faas_config.get('source'):
+            return 'zip'
+
+        # Check for inline code
+        if faas_config.get('inline_code'):
+            if hasattr(task, 'image') and task.image:
+                return 'container-build'
+            return 'zip'
+
+        return 'unknown'
+
+    def _is_full_image_uri(self, image: str) -> bool:
+        """Check if image is a full URI."""
+        if not image:
+            return False
+        base_images = ['python:3.9', 'python:3.10', 'python:3.11', 'python:3.12']
+        if image in base_images:
+            return False
+        return ('/' in image or
+                ':' in image and not image.startswith('python:') or
+                '.amazonaws.com' in image or
+                '.azurecr.io' in image)
+
     def _prepare_task_for_faas(self, task: Task) -> None:
         """Adapt HYDRA Task for FaaS deployment."""
-        # Use existing Task attributes creatively
-        if not hasattr(task, 'cmd') or not task.cmd:
-            task.cmd = ['python', '-c', 'print("No function provided")']
+        # Don't add default cmd - let it fail if not properly configured
 
         # Map FaaS concepts to Task attributes
-        if not task.vcpus:
-            task.vcpus = 0.25  # Default 256MB Lambda
         if not task.memory:
             task.memory = 256  # Default memory
 
-        # Extract and separate FaaS config from user env vars
+        # Extract and process FaaS config
         faas_config = self._extract_faas_config(task)
 
         # Store processed FaaS config back in env_var for providers
         if not task.env_var:
             task.env_var = []
 
-        # Add back FaaS config
+        # Store user env vars separately
+        user_env_vars = []
+        new_env_var = []
+
+        # Process env vars to separate FaaS config from user vars
+        for var in list(task.env_var):  # Create a copy to iterate over
+            if isinstance(var, str) and '=' in var:
+                key, value = var.split('=', 1)
+                if not key.startswith('FAAS_'):
+                    user_env_vars.append(var)
+                    new_env_var.append(var)
+                # FAAS_ vars are already in faas_config
+            else:
+                new_env_var.append(var)
+
+        # Store user env vars for providers to use
+        task._user_env_vars = user_env_vars
+
+        # Update task env_var to only contain user vars
+        task.env_var = new_env_var
+
+        # Re-add FaaS config to env_var for provider compatibility
         for key, value in faas_config.items():
             task.env_var.append(f"FAAS_{key.upper()}={value}")
 
     def _extract_faas_config(self, task: Task) -> Dict[str, Any]:
         """Extract FaaS configuration from FAAS_* env vars."""
         faas_config = {}
-        user_env_vars = []
 
         if task.env_var:
-            new_env_var = []
             for var in task.env_var:
                 if isinstance(var, str) and '=' in var:
                     key, value = var.split('=', 1)
@@ -306,24 +415,12 @@ class FaasManager:
                         # FaaS configuration
                         config_key = key.replace('FAAS_', '').lower()
                         faas_config[config_key] = value
-                    else:
-                        # User runtime environment variable
-                        user_env_vars.append(var)
-                        new_env_var.append(var)
-                else:
-                    new_env_var.append(var)
 
-            # Update task env_var to only contain user vars
-            task.env_var = new_env_var
-
-        # Store user env vars for providers to use
-        task._user_env_vars = user_env_vars
-
-        # Apply defaults
-        faas_config.setdefault('handler', 'handler.handler')
+        # Apply defaults (but not for inline code)
+        if 'handler' not in faas_config and 'inline_code' not in faas_config:
+            faas_config.setdefault('handler', 'handler.handler')
         faas_config.setdefault('runtime', 'python3.9')
         faas_config.setdefault('timeout', '30')
-        faas_config.setdefault('source', '')
 
         return faas_config
 
@@ -335,7 +432,7 @@ class FaasManager:
                 if isinstance(var, str) and var.startswith('FAAS_PROVIDER='):
                     provider = var.split('=', 1)[1].lower()
                     # Ensure provider is available
-                    with self._provider_lock:
+                    with self._manager_lock:
                         if provider not in self._provider_factories:
                             raise FaasException(f"Requested provider '{provider}' not available")
                     return provider
@@ -348,14 +445,14 @@ class FaasManager:
                 return 'nuclio'
 
         # Default to first available provider
-        with self._provider_lock:
+        with self._manager_lock:
             return next(iter(self._provider_factories.keys()))
 
     def _wait_for_dependencies(self, task: Task) -> None:
         """Wait for task dependencies to complete."""
         for dep_id in task.depends_on:
             # Check if dependency is deployed
-            with self._function_map_lock:
+            with self._manager_lock:
                 if dep_id not in self._task_to_function_map:
                     raise FaasException(f"Dependency {dep_id} not found")
 
@@ -363,7 +460,7 @@ class FaasManager:
             self.logger.trace(f"Task {task.id} waiting for dependency {dep_id}")
 
     def submit(self, tasks: Union[Task, List[Task]]) -> None:
-        """Submit tasks for processing following HYDRA pattern.
+        """Submit tasks for processing with metrics tracking.
 
         Args:
             tasks: Single task or list of tasks to deploy as functions.
@@ -374,25 +471,36 @@ class FaasManager:
         if not isinstance(tasks, list):
             tasks = [tasks]
 
-        self.profiler.prof('submit_start', uid='batch')
+        if self.enable_metrics:
+            self.profiler.prof('submit_start', uid='batch')
 
-        for task in tasks:
-            # Validate task
-            if not isinstance(task, Task):
-                raise TypeError(f"Expected Task object, got {type(task)}")
+        if self.asynchronous:
+            # For async mode, submit directly to thread pool for true parallelism
+            futures = []
+            for task in tasks:
+                if not isinstance(task, Task):
+                    raise TypeError(f"Expected Task object, got {type(task)}")
 
-            # Queue for processing
-            if self.asynchronous:
-                self.incoming_q.put(task)
-            else:
+                future = self.deployment_executor.submit(self._process_task, task)
+                futures.append((task, future))
+
+            # Store futures for tracking if needed
+            self._pending_deployments.extend(futures)
+        else:
+            # Synchronous mode - process sequentially
+            for task in tasks:
+                if not isinstance(task, Task):
+                    raise TypeError(f"Expected Task object, got {type(task)}")
                 self._process_task(task)
 
-        self.profiler.prof('submit_end', uid='batch')
+        if self.enable_metrics:
+            self.profiler.prof('submit_end', uid='batch')
+
         self.logger.trace(f"Submitted {len(tasks)} tasks")
 
     def invoke(self, function_name: str, payload: Any = None,
                provider: Optional[str] = None) -> Any:
-        """Invoke a deployed function.
+        """Invoke a deployed function with metrics tracking.
 
         Args:
             function_name: Name of the function to invoke.
@@ -405,70 +513,202 @@ class FaasManager:
         if not self.status:
             raise FaasException("Manager not started")
 
-        self.profiler.prof('invoke_start', uid=function_name)
-
+        invocation_id = None
         try:
+            # Start invocation metrics
+            if self.metrics_collector:
+                payload_size = len(json.dumps(payload)) if payload else 0
+                invocation_id = self.metrics_collector.start_invocation(
+                    function_name=function_name,
+                    payload_size=payload_size
+                )
+
+            # Performance optimization: Check cache first
+            if not provider:
+                with self._manager_lock:
+                    provider = self._function_to_provider_cache.get(function_name)
+
             if provider:
-                provider_name = provider.lower()
-                provider_dict = self._get_provider(provider_name)
+                # Fast path: we know which provider has this function
+                provider_dict = self._get_provider(provider)
                 result = provider_dict['instance'].invoke_function(
                     function_name, payload
                 )
             else:
-                # Try to find function in any provider
-                with self._function_map_lock:
-                    if function_name in self._function_to_provider:
-                        provider_name = self._function_to_provider[function_name]
+                # Slow path: search all providers
+                found = False
+                with self._manager_lock:
+                    provider_names = list(self._providers.keys())
+
+                for provider_name in provider_names:
+                    try:
                         provider_dict = self._get_provider(provider_name)
                         result = provider_dict['instance'].invoke_function(
                             function_name, payload
                         )
-                    else:
-                        # Search all providers
-                        found = False
-                        with self._provider_lock:
-                            for provider_name in list(self._providers.keys()):
-                                try:
-                                    provider_dict = self._providers[provider_name]
-                                    result = provider_dict['instance'].invoke_function(
-                                        function_name, payload
-                                    )
-                                    found = True
-                                    break
-                                except InvocationException:
-                                    continue
+                        # Cache for next time
+                        with self._manager_lock:
+                            self._function_to_provider_cache[function_name] = provider_name
+                        found = True
+                        break
+                    except InvocationException:
+                        continue
 
-                        if not found:
-                            raise FaasException(f"Function '{function_name}' not found")
+                if not found:
+                    raise FaasException(f"Function '{function_name}' not found")
 
-            self.profiler.prof('invoke_end', uid=function_name)
+            # Complete invocation metrics
+            if self.metrics_collector and invocation_id:
+                self.metrics_collector.complete_invocation(
+                    invocation_id,
+                    status='success'
+                )
+
             return result
 
         except Exception as e:
-            self.profiler.prof('invoke_failed', uid=function_name)
+            # Complete invocation metrics with failure
+            if self.metrics_collector and invocation_id:
+                self.metrics_collector.complete_invocation(
+                    invocation_id,
+                    status='failed',
+                    error_message=str(e)
+                )
             raise
 
+    def invoke_parallel(self, invocations: List[Dict[str, Any]]) -> List[Any]:
+        """Invoke multiple functions in parallel with metrics tracking.
+
+        Args:
+            invocations: List of dicts with 'function_name', 'payload', and optional 'provider'
+
+        Returns:
+            List of results in the same order as invocations.
+        """
+        if not self.status:
+            raise FaasException("Manager not started")
+
+        # Track metrics for all invocations
+        invocation_ids = []
+        if self.metrics_collector:
+            for inv in invocations:
+                payload_size = len(json.dumps(inv.get('payload'))) if inv.get('payload') else 0
+                inv_id = self.metrics_collector.start_invocation(
+                    function_name=inv['function_name'],
+                    payload_size=payload_size
+                )
+                invocation_ids.append(inv_id)
+
+        # Submit all invocations to the invocation thread pool
+        futures = []
+        for inv in invocations:
+            future = self.invocation_executor.submit(
+                self.invoke,
+                inv['function_name'],
+                inv.get('payload'),
+                inv.get('provider')
+            )
+            futures.append(future)
+
+        # Collect results and complete metrics
+        results = []
+        for i, future in enumerate(futures):
+            try:
+                result = future.result()
+                results.append(result)
+
+                # Complete metrics for successful invocation
+                if self.metrics_collector and i < len(invocation_ids):
+                    self.metrics_collector.complete_invocation(
+                        invocation_ids[i],
+                        status='success'
+                    )
+            except Exception as e:
+                results.append({'error': str(e)})
+
+                # Complete metrics for failed invocation
+                if self.metrics_collector and i < len(invocation_ids):
+                    self.metrics_collector.complete_invocation(
+                        invocation_ids[i],
+                        status='failed',
+                        error_message=str(e)
+                    )
+
+        return results
+
+    def get_metrics(self) -> Optional[MetricsCollector]:
+        """Get the metrics collector instance.
+
+        Returns:
+            The metrics collector if enabled, None otherwise.
+        """
+        return self.metrics_collector
+
+    def get_deployment_stats(self) -> Any:
+        """Get deployment statistics from metrics collector.
+
+        Returns:
+            Pandas DataFrame with deployment statistics or None.
+        """
+        if self.metrics_collector:
+            return self.metrics_collector.get_deployment_statistics()
+        return None
+
+    def get_invocation_stats(self) -> Any:
+        """Get invocation statistics from metrics collector.
+
+        Returns:
+            Pandas DataFrame with invocation statistics or None.
+        """
+        if self.metrics_collector:
+            return self.metrics_collector.get_invocation_statistics()
+        return None
+
+    def save_metrics(self, filename: str = "faas_metrics.json") -> Optional[str]:
+        """Save current metrics to file.
+
+        Args:
+            filename: Name of the file to save metrics to.
+
+        Returns:
+            Path to saved file or None if metrics disabled.
+        """
+        if self.metrics_collector:
+            return str(self.metrics_collector.save_results(filename))
+        return None
+
     def shutdown(self) -> None:
-        """Shutdown the FaaS Manager following HYDRA pattern."""
+        """Shutdown the FaaS Manager with proper metrics cleanup."""
         if not self.status:
             return
 
         self.logger.trace("Shutting down FaaS manager")
-        self.profiler.prof('shutdown_start', uid='manager')
+        if self.enable_metrics:
+            self.profiler.prof('shutdown_start', uid='manager')
 
         # Signal termination
         self._terminate.set()
 
-        # Wait for worker thread
-        if self._worker_thread and self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=5)
+        # Wait for pending deployments if any
+        for task, future in self._pending_deployments:
+            try:
+                future.result(timeout=30)
+            except Exception as e:
+                self.logger.error(f"Error waiting for task {task.id}: {e}")
+
+        # Save final metrics before shutting down providers
+        if self.metrics_collector:
+            self.logger.trace("Saving final metrics before shutdown")
+            final_metrics_path = self.save_metrics("final_metrics.json")
+            if final_metrics_path:
+                self.logger.trace(f"Final metrics saved to: {final_metrics_path}")
 
         # Shutdown providers
         shutdown_futures = []
-        with self._provider_lock:
+        with self._manager_lock:
             for name, provider_info in self._providers.items():
                 self.logger.trace(f"Shutting down provider: {name}")
-                future = self.executor.submit(provider_info['instance'].shutdown)
+                future = self.deployment_executor.submit(provider_info['instance'].shutdown)
                 shutdown_futures.append(future)
 
         # Wait for shutdowns
@@ -478,11 +718,23 @@ class FaasManager:
             except Exception as e:
                 self.logger.error(f"Error during provider shutdown: {e}")
 
-        # Cleanup
-        self.executor.shutdown(wait=True)
+        # Shutdown metrics collector
+        if self.metrics_collector:
+            self.logger.trace("Shutting down metrics collector")
+            self.metrics_collector.shutdown()
+
+        # Cleanup thread pools
+        self.deployment_executor.shutdown(wait=True)
+        self.invocation_executor.shutdown(wait=True)
+
+        # Shutdown the global packaging dependency installer
+        packaging.shutdown_packaging()
+
         self.status = False
 
-        self.profiler.prof('shutdown_end', uid='manager')
+        if self.enable_metrics:
+            self.profiler.prof('shutdown_end', uid='manager')
+
         self.logger.trace("FaaS manager shutdown complete")
 
     def __call__(self, func: Callable = None, provider: str = '') -> Callable:

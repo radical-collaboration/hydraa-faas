@@ -1,4 +1,0 @@
-#time,event,comp,thread,uid,state,msg
-1754483482.1593201,sync_abs,hydraa.services.caas_manager.kubernetes.kubernetes,NuclioInit,,,1.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa:127.0.0.1:1754483482.1574929:1754483482.1574929:sys
-1754483482.1695960,bootstrap_start,hydraa.services.caas_manager.kubernetes.kubernetes,NuclioInit,nuclio-3ea801jq,,
-1754483482.1696630,cofigure_start,hydraa.services.caas_manager.kubernetes.kubernetes,NuclioInit,nuclio-3ea801jq,,

@@ -3,8 +3,11 @@ hydraa @ git+https://github.com/radical-project/radical.dream.git
 aiohttp
 boto3
 botocore
+docker
 httpx
+pandas
 nuclio-jupyter
+psutil
 pyyaml
 
 # dependencies hydraa failed to install
